@@ -1,18 +1,29 @@
 use std::error::Error;
+use std::fmt::Formatter;
 
 use bytes::Bytes;
 use raft::eraftpb;
-use serde::{Deserialize, Serialize};
+use serde::de::{Unexpected, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 mod rocks_db;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EntryType {
-    EntryNormal = 0,
-    EntryConfChange = 1,
-    EntryConfChangeV2 = 2,
+    EntryNormal,
+    EntryConfChange,
+    EntryConfChangeV2,
+}
+
+impl From<EntryType> for i32 {
+    fn from(et: EntryType) -> Self {
+        match et {
+            EntryType::EntryNormal => 0,
+            EntryType::EntryConfChange => 1,
+            EntryType::EntryConfChangeV2 => 2,
+        }
+    }
 }
 
 impl From<eraftpb::EntryType> for EntryType {
@@ -22,6 +33,44 @@ impl From<eraftpb::EntryType> for EntryType {
             eraftpb::EntryType::EntryConfChange => EntryType::EntryConfChange,
             eraftpb::EntryType::EntryConfChangeV2 => EntryType::EntryConfChangeV2,
         }
+    }
+}
+
+impl Serialize for EntryType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_i32(i32::from(*self))
+    }
+}
+
+struct EntryTypeVisitor;
+
+impl<'de> Visitor<'de> for EntryTypeVisitor {
+    type Value = EntryType;
+
+    fn expecting(&self, formatter: &mut Formatter) -> std::fmt::Result {
+        formatter.write_str("valid value is 0, 1, or 2")
+    }
+
+    fn visit_i32<E>(self, v: i32) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match EntryType::try_from(v) {
+            Ok(et) => Ok(et),
+            Err(err) => Err(E::invalid_value(Unexpected::Signed(err.0 as _), &self)),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EntryType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_i32(EntryTypeVisitor)
     }
 }
 
