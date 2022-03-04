@@ -1,11 +1,13 @@
 use std::io;
 use std::io::ErrorKind;
+use std::path::Path;
 
 use bincode::config::{BigEndian, VarintEncoding, WithOtherEndian, WithOtherIntEncoding};
 use bincode::{DefaultOptions, Options};
 use bytes::{BufMut, BytesMut};
 use raft::{Error, StorageError};
 use rocksdb::{ColumnFamily, WriteBatch, DB};
+use tap::TapFallible;
 use tracing::{error, info};
 
 use crate::storage::key_value::KeyValueDatabaseBackend;
@@ -40,6 +42,35 @@ pub struct RocksdbBackend {
 }
 
 impl RocksdbBackend {
+    fn from_exist(db_path: &Path, config_state: ConfigState) -> anyhow::Result<Self> {
+        let db = DB::open_cf(
+            &rocksdb::Options::default(),
+            db_path,
+            [ENTRIES_COLUMN_FAMILY],
+        )
+        .tap_err(|err| {
+            error!(%err, ?db_path, "open rocksdb failed");
+        })?;
+
+        info!("open rocksdb done");
+
+        let data_encoding = DefaultOptions::new()
+            .with_big_endian()
+            .with_varint_encoding();
+
+        let mut backend = Self { db, data_encoding };
+
+        backend
+            .apply_config_state(config_state.clone())
+            .tap_err(|err| {
+                error!(%err, ?config_state, "apply current config state failed");
+            })?;
+
+        info!(?config_state, "apply current config state done");
+
+        Ok(backend)
+    }
+
     fn apply_hard_state_with_batch(
         &mut self,
         hard_state: &HardState,
@@ -152,6 +183,120 @@ impl RocksdbBackend {
         })?;
 
         Ok(column_family_handle)
+    }
+
+    fn create_snapshot<KV: KeyValueDatabaseBackend>(
+        &self,
+        request_index: u64,
+        backend: &KV,
+    ) -> Result<Snapshot, Error> {
+        let hard_state = self.initial_hard_state()?;
+
+        info!(?hard_state, "get hard state done");
+
+        if request_index > hard_state.commit {
+            error!(
+                request_index,
+                commit_index = hard_state.commit,
+                "request index > commit index"
+            );
+
+            return Err(Error::Store(StorageError::Other(
+                format!(
+                    "request index {} > commit index {}",
+                    request_index, hard_state.commit
+                )
+                .into(),
+            )));
+        }
+
+        let first_index = self.first_index()?;
+
+        info!(first_index, "get first index done");
+
+        let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
+
+        info!("get entry column family handle done");
+
+        let mut write_batch = WriteBatch::default();
+
+        for delete_index in first_index..=hard_state.commit {
+            let delete_entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, delete_index);
+
+            info!(delete_index, %delete_entry_path, "delete entry path");
+
+            write_batch.delete_cf(column_family_handle, &delete_entry_path);
+
+            info!(delete_index, %delete_entry_path, "delete entry to write batch done");
+        }
+
+        let config_state = self.initial_config_state()?;
+
+        info!(?config_state, "get current config state done");
+
+        let mut buf = BytesMut::with_capacity(4096).writer();
+
+        let new_snapshot_metadata = SnapshotMetadata {
+            config_state: Some(config_state),
+            index: hard_state.commit,
+            term: hard_state.term,
+        };
+
+        self.data_encoding
+            .serialize_into(&mut buf, &new_snapshot_metadata)
+            .map_err(|err| {
+                error!(%err, "serialize new snapshot metadata failed");
+
+                Error::Store(StorageError::Other(err))
+            })?;
+
+        info!(
+            ?new_snapshot_metadata,
+            "serialize new snapshot metadata done"
+        );
+
+        let new_snapshot_metadata_data = buf.get_mut().split();
+
+        write_batch.put(SNAPSHOT_METADATA_PATH, new_snapshot_metadata_data);
+
+        info!("insert new snapshot metadata to write batch done");
+
+        let key_value_pairs = backend.all().map_err(|err| {
+            error!(%err, "get all key value pairs failed");
+
+            Error::Store(StorageError::Other(err.into()))
+        })?;
+
+        info!("get all key value pairs done");
+
+        self.data_encoding
+            .serialize_into(&mut buf, &key_value_pairs)
+            .map_err(|err| {
+                error!(%err, "serialize all key value pairs failed");
+
+                Error::Store(StorageError::Other(err))
+            })?;
+
+        info!("serialize all key value pairs to snapshot data done");
+
+        let new_snapshot_data = buf.into_inner().freeze();
+
+        write_batch.put(SNAPSHOT_DATA_PATH, new_snapshot_data.clone());
+
+        info!("insert new snapshot data to write batch done");
+
+        self.db.write(write_batch).map_err(|err| {
+            error!(%err, "the whole update snapshot operation failed");
+
+            Error::Io(io::Error::new(ErrorKind::Other, err))
+        })?;
+
+        info!("the whole update snapshot operation done");
+
+        Ok(Snapshot {
+            data: new_snapshot_data,
+            metadata: new_snapshot_metadata,
+        })
     }
 }
 
@@ -283,6 +428,16 @@ impl LogBackend for RocksdbBackend {
     }
 
     fn apply_commit_index(&mut self, commit_index: u64) -> Result<(), Self::Error> {
+        let last_index = self.last_index()?;
+
+        info!(last_index, "get last index done");
+
+        if last_index < commit_index {
+            error!(last_index, commit_index, "last index < commit index");
+
+            return Err(Error::Store(StorageError::Unavailable));
+        }
+
         let mut hard_state = self.initial_hard_state()?;
 
         info!(?hard_state, "get hard state done");
@@ -330,6 +485,12 @@ impl LogBackend for RocksdbBackend {
         self.apply_hard_state_with_batch(&hard_state, Some(&mut write_batch), &mut buf)?;
 
         info!(new_hard_state = ?hard_state, "insert new hard state to write batch done");
+
+        if let Some(config_state) = &snapshot_metadata.config_state {
+            self.apply_config_state_with_batch(config_state, Some(&mut write_batch), &mut buf)?;
+
+            info!(new_config_state = ?config_state, "insert new config state to write batch done");
+        }
 
         let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
 
@@ -392,7 +553,7 @@ impl LogBackend for RocksdbBackend {
     }
 
     fn initial_hard_state(&self) -> Result<HardState, Self::Error> {
-        let hard_state = self.db.get(HARD_STATE_PATH).map_err(|err| {
+        let hard_state = self.db.get_pinned(HARD_STATE_PATH).map_err(|err| {
             error!(%err, "get hard state failed");
 
             Error::Store(StorageError::Other(err.into()))
@@ -425,7 +586,7 @@ impl LogBackend for RocksdbBackend {
     }
 
     fn initial_config_state(&self) -> Result<ConfigState, Self::Error> {
-        let config_state = self.db.get(CONFIG_STATE_PATH).map_err(|err| {
+        let config_state = self.db.get_pinned(CONFIG_STATE_PATH).map_err(|err| {
             error!(%err, "get config state failed");
 
             Error::Store(StorageError::Other(err.into()))
@@ -624,13 +785,11 @@ impl LogBackend for RocksdbBackend {
             }
 
             Some(last_index) => {
-                let last_index = String::from_utf8_lossy(&last_index)
-                    .parse::<u64>()
-                    .map_err(|err| {
-                        error!(%err, "deserialize last index failed");
+                let last_index = self.data_encoding.deserialize(&last_index).map_err(|err| {
+                    error!(%err, "deserialize last index failed");
 
-                        Error::Store(StorageError::Other(err.into()))
-                    })?;
+                    Error::Store(StorageError::Other(err.into()))
+                })?;
 
                 Ok(last_index)
             }
@@ -675,108 +834,650 @@ impl LogBackend for RocksdbBackend {
             };
         }
 
-        let hard_state = self.initial_hard_state()?;
+        self.create_snapshot(request_index, backend)
+    }
+}
 
-        info!(?hard_state, "get hard state done");
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::env;
 
-        if request_index > hard_state.commit {
-            error!(
-                request_index,
-                commit_index = hard_state.commit,
-                "request index > commit index"
-            );
+    use bytes::Bytes;
+    use once_cell::sync::OnceCell;
+    use tempfile::TempDir;
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::fmt::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Registry;
 
-            return Err(Error::Store(StorageError::Other(
-                format!(
-                    "request index {} > commit index {}",
-                    request_index, hard_state.commit
-                )
-                .into(),
-            )));
-        }
+    use crate::storage::key_value::{KeyValueOperation, KeyValuePair, Operation};
+    use crate::storage::log::EntryType;
 
-        let first_index = self.first_index()?;
+    use super::*;
 
-        info!(first_index, "get first index done");
+    fn init_log() {
+        static INIT_LOG: OnceCell<()> = OnceCell::new();
 
-        let mut write_batch = WriteBatch::default();
+        INIT_LOG.get_or_init(|| {
+            let layer = Layer::new().pretty();
 
-        let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
+            let layered = Registry::default().with(layer).with(LevelFilter::INFO);
 
-        info!("get entry column family handle done");
+            tracing::subscriber::set_global_default(layered).unwrap();
+        });
+    }
 
-        for delete_index in first_index..=hard_state.commit {
-            let delete_entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, delete_index);
+    fn create_test_db<O: Options + Copy>(path: &Path, encoding: O) {
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
 
-            info!(delete_index, %delete_entry_path, "delete entry path");
+        let db = DB::open_cf(&options, path, [ENTRIES_COLUMN_FAMILY]).unwrap();
 
-            write_batch.delete_cf(column_family_handle, &delete_entry_path);
+        let hard_state = HardState::default();
+        let config_state = ConfigState::default();
 
-            info!(delete_index, %delete_entry_path, "delete entry to write batch done");
-        }
+        let hard_state = encoding.serialize(&hard_state).unwrap();
 
-        let mut buf = BytesMut::with_capacity(4096).writer();
+        db.put(HARD_STATE_PATH, hard_state).unwrap();
 
-        let new_snapshot_metadata = SnapshotMetadata {
-            config_state: snapshot_metadata.config_state,
-            index: hard_state.commit,
-            term: hard_state.term,
+        let config_state = encoding.serialize(&config_state).unwrap();
+
+        db.put(CONFIG_STATE_PATH, config_state).unwrap();
+
+        let snapshot_metadata = SnapshotMetadata::default();
+
+        let snapshot_metadata = encoding.serialize(&snapshot_metadata).unwrap();
+
+        db.put(SNAPSHOT_METADATA_PATH, snapshot_metadata).unwrap();
+
+        let snapshot_data = Vec::<KeyValuePair>::new();
+
+        let snapshot_data = encoding.serialize(&snapshot_data).unwrap();
+
+        db.put(SNAPSHOT_DATA_PATH, snapshot_data).unwrap();
+
+        let last_index = encoding.serialize(&0u64).unwrap();
+
+        db.put(LAST_INDEX_PATH, last_index).unwrap();
+    }
+
+    fn encoding() -> impl Options + Copy {
+        DefaultOptions::new()
+            .with_big_endian()
+            .with_varint_encoding()
+    }
+
+    fn create_backend() -> RocksdbBackend {
+        create_backend_with_config_state(Default::default())
+    }
+
+    fn create_backend_with_config_state(config_state: ConfigState) -> RocksdbBackend {
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+
+        create_test_db(tmp_dir.path(), encoding());
+
+        RocksdbBackend::from_exist(tmp_dir.path(), config_state).unwrap()
+    }
+
+    #[test]
+    fn test_from_exist() {
+        init_log();
+
+        create_backend();
+    }
+
+    #[test]
+    fn test_first_index() {
+        init_log();
+
+        let backend = create_backend();
+
+        assert_eq!(backend.first_index().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_last_index() {
+        init_log();
+
+        let backend = create_backend();
+
+        assert_eq!(backend.last_index().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_hard_state() {
+        init_log();
+
+        let backend = create_backend();
+
+        let hard_state = backend.initial_hard_state().unwrap();
+
+        assert_eq!(hard_state, HardState::default())
+    }
+
+    #[test]
+    fn test_config_state() {
+        init_log();
+
+        let config_state = ConfigState {
+            voters: vec![1, 2, 3],
+            learners: vec![],
+            voters_outgoing: vec![],
+            learners_next: vec![],
+            auto_leave: false,
         };
 
-        self.data_encoding
-            .serialize_into(&mut buf, &new_snapshot_metadata)
-            .map_err(|err| {
-                error!(%err, "serialize new snapshot metadata failed");
+        let backend = create_backend_with_config_state(config_state.clone());
 
-                Error::Store(StorageError::Other(err))
-            })?;
+        assert_eq!(backend.initial_config_state().unwrap(), config_state)
+    }
 
-        info!(
-            ?new_snapshot_metadata,
-            "serialize new snapshot metadata done"
+    #[test]
+    fn test_append_entries() {
+        init_log();
+
+        let mut backend = create_backend();
+
+        backend
+            .append_entries(vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+            ])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_term() {
+        init_log();
+
+        let mut backend = create_backend();
+
+        backend
+            .append_entries(vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(backend.term(1).unwrap(), 1);
+        assert_eq!(backend.term(2).unwrap(), 1);
+        dbg!(backend.term(3).unwrap_err());
+    }
+
+    #[test]
+    fn test_first_index_after_append_entries() {
+        init_log();
+
+        let mut backend = create_backend();
+
+        backend
+            .append_entries(vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(backend.first_index().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_last_index_after_append_entries() {
+        init_log();
+
+        let mut backend = create_backend();
+
+        backend
+            .append_entries(vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(backend.last_index().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_apply_hard_state() {
+        init_log();
+
+        let mut backend = create_backend();
+
+        backend
+            .append_entries(vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+            ])
+            .unwrap();
+
+        let hard_state = HardState {
+            term: 1,
+            vote: 0,
+            commit: 1,
+        };
+
+        backend.apply_hard_state(hard_state.clone()).unwrap();
+
+        assert_eq!(backend.initial_hard_state().unwrap(), hard_state);
+    }
+
+    #[test]
+    fn test_apply_config_state() {
+        init_log();
+
+        let mut backend = create_backend();
+
+        let mut config_state = backend.initial_config_state().unwrap();
+        config_state.voters.push(1);
+
+        backend.apply_config_state(config_state.clone()).unwrap();
+
+        assert_eq!(backend.initial_config_state().unwrap(), config_state);
+    }
+
+    #[test]
+    fn test_apply_commit_index() {
+        init_log();
+
+        let mut backend = create_backend();
+
+        backend
+            .append_entries(vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+            ])
+            .unwrap();
+
+        let mut hard_state = backend.initial_hard_state().unwrap();
+
+        backend.apply_commit_index(2).unwrap();
+
+        hard_state.commit = 2;
+
+        assert_eq!(backend.initial_hard_state().unwrap(), hard_state);
+    }
+
+    #[test]
+    fn test_entries() {
+        init_log();
+
+        let mut backend = create_backend();
+
+        backend
+            .append_entries(vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+            ])
+            .unwrap();
+
+        let mut entries = backend.entries(1, 3, None).unwrap();
+
+        assert_eq!(
+            entries,
+            vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: Default::default(),
+                    context: Default::default(),
+                },
+            ]
         );
 
-        let new_snapshot_metadata_data = buf.get_mut().split();
+        entries = backend.entries(1, 1, None).unwrap();
+        assert!(entries.is_empty());
 
-        write_batch.put(SNAPSHOT_METADATA_PATH, new_snapshot_metadata_data);
+        entries = backend.entries(1, 2, None).unwrap();
+        assert_eq!(
+            entries,
+            vec![Entry {
+                entry_type: EntryType::EntryNormal,
+                term: 1,
+                index: 1,
+                data: Default::default(),
+                context: Default::default(),
+            }]
+        );
 
-        info!("insert new snapshot metadata to write batch done");
+        entries = backend.entries(2, 3, None).unwrap();
+        assert_eq!(
+            entries,
+            vec![Entry {
+                entry_type: EntryType::EntryNormal,
+                term: 1,
+                index: 2,
+                data: Default::default(),
+                context: Default::default(),
+            }]
+        )
+    }
 
-        let key_value_pairs = backend.all().map_err(|err| {
-            error!(%err, "get all key value pairs failed");
+    #[derive(Default)]
+    struct TestKVBackend {
+        map: HashMap<Bytes, Bytes>,
+    }
 
-            Error::Store(StorageError::Other(err.into()))
-        })?;
+    impl KeyValueDatabaseBackend for TestKVBackend {
+        type Error = raft::Error;
 
-        info!("get all key value pairs done");
+        fn apply_key_value_operation(
+            &mut self,
+            operations: Vec<KeyValueOperation>,
+        ) -> Result<(), Self::Error> {
+            for operation in operations {
+                match operation.operation {
+                    Operation::InsertOrUpdate => {
+                        self.map.insert(operation.key, operation.value);
+                    }
+                    Operation::Delete => {
+                        self.map.remove(&operation.key);
+                    }
+                }
+            }
 
-        self.data_encoding
-            .serialize_into(&mut buf, &key_value_pairs)
-            .map_err(|err| {
-                error!(%err, "serialize all key value pairs failed");
+            Ok(())
+        }
 
-                Error::Store(StorageError::Other(err))
-            })?;
+        fn get(&mut self, key: &Bytes) -> Result<Option<Bytes>, Self::Error> {
+            Ok(self.map.get(key).cloned())
+        }
 
-        info!("serialize all key value pairs to snapshot data done");
+        fn apply_key_value_pairs(
+            &mut self,
+            pairs: HashSet<KeyValuePair>,
+        ) -> Result<(), Self::Error> {
+            self.map.clear();
 
-        let new_snapshot_data = buf.into_inner().freeze();
+            for pair in pairs {
+                self.map.insert(pair.key, pair.value);
+            }
 
-        write_batch.put(SNAPSHOT_DATA_PATH, new_snapshot_data.clone());
+            Ok(())
+        }
 
-        info!("insert new snapshot data to write batch done");
+        fn all(&self) -> Result<Vec<KeyValuePair>, Self::Error> {
+            Ok(self
+                .map
+                .iter()
+                .map(|(key, value)| KeyValuePair::new(key.clone(), value.clone()))
+                .collect())
+        }
+    }
 
-        self.db.write(write_batch).map_err(|err| {
-            error!(%err, "the whole update snapshot operation failed");
+    #[test]
+    fn test_snapshot() {
+        init_log();
 
-            Error::Io(io::Error::new(ErrorKind::Other, err))
-        })?;
+        let mut backend = create_backend_with_config_state(ConfigState::default());
 
-        info!("the whole update snapshot operation done");
+        let encoding = encoding();
 
-        Ok(Snapshot {
-            data: new_snapshot_data,
-            metadata: new_snapshot_metadata,
-        })
+        let kv_op1 = KeyValueOperation {
+            operation: Operation::InsertOrUpdate,
+            key: Bytes::from(b"test1".as_slice()),
+            value: Bytes::from(b"test1".as_slice()),
+        };
+
+        let kv_op2 = KeyValueOperation {
+            operation: Operation::InsertOrUpdate,
+            key: Bytes::from(b"test2".as_slice()),
+            value: Bytes::from(b"test2".as_slice()),
+        };
+
+        backend
+            .append_entries(vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: encoding.serialize(&kv_op1).unwrap().into(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: encoding.serialize(&kv_op2).unwrap().into(),
+                    context: Default::default(),
+                },
+            ])
+            .unwrap();
+
+        let mut hard_state = backend.initial_hard_state().unwrap();
+        hard_state.commit = 2;
+        hard_state.term = 1;
+
+        backend.apply_hard_state(hard_state).unwrap();
+
+        let mut kv_backend = TestKVBackend::default();
+
+        kv_backend
+            .apply_key_value_operation(vec![kv_op1, kv_op2])
+            .unwrap();
+
+        let snapshot = backend.snapshot(2, &kv_backend).unwrap();
+
+        assert_eq!(
+            snapshot.metadata,
+            SnapshotMetadata {
+                config_state: Some(ConfigState::default()),
+                index: 2,
+                term: 1,
+            }
+        );
+
+        let key_value_pairs: Vec<KeyValuePair> = encoding.deserialize(&snapshot.data).unwrap();
+
+        // we use key: Bytes to implement PartialEq
+        #[allow(clippy::mutable_key_type)]
+        let key_value_pairs = key_value_pairs.into_iter().collect::<HashSet<_>>();
+
+        assert_eq!(
+            key_value_pairs,
+            HashSet::from([
+                KeyValuePair {
+                    key: b"test1".as_slice().into(),
+                    value: b"test1".as_slice().into(),
+                },
+                KeyValuePair {
+                    key: b"test2".as_slice().into(),
+                    value: b"test2".as_slice().into(),
+                }
+            ])
+        )
+    }
+
+    #[test]
+    fn test_apply_snapshot() {
+        init_log();
+
+        let mut backend = create_backend();
+
+        let encoding = encoding();
+
+        let kv_op1 = KeyValueOperation {
+            operation: Operation::InsertOrUpdate,
+            key: Bytes::from(b"test1".as_slice()),
+            value: Bytes::from(b"test1".as_slice()),
+        };
+
+        let kv_op2 = KeyValueOperation {
+            operation: Operation::InsertOrUpdate,
+            key: Bytes::from(b"test2".as_slice()),
+            value: Bytes::from(b"test2".as_slice()),
+        };
+
+        backend
+            .append_entries(vec![
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 1,
+                    data: encoding.serialize(&kv_op1).unwrap().into(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 2,
+                    data: encoding.serialize(&kv_op2).unwrap().into(),
+                    context: Default::default(),
+                },
+                Entry {
+                    entry_type: EntryType::EntryNormal,
+                    term: 1,
+                    index: 3,
+                    data: encoding.serialize(&kv_op2).unwrap().into(),
+                    context: Default::default(),
+                },
+            ])
+            .unwrap();
+
+        let pairs = vec![
+            KeyValuePair::new(b"test11".as_slice().into(), b"test11".as_slice().into()),
+            KeyValuePair::new(b"test22".as_slice().into(), b"test22".as_slice().into()),
+        ];
+
+        let snapshot_data = encoding.serialize(&pairs).unwrap();
+
+        let snapshot = Snapshot {
+            data: snapshot_data.into(),
+            metadata: SnapshotMetadata {
+                config_state: Some(ConfigState {
+                    voters: vec![1],
+                    ..Default::default()
+                }),
+                index: 2,
+                term: 2,
+            },
+        };
+
+        backend.apply_snapshot(snapshot).unwrap();
+
+        assert_eq!(backend.first_index().unwrap(), 3);
+        assert_eq!(backend.last_index().unwrap(), 3);
+
+        assert_eq!(
+            backend.entries(3, 4, None).unwrap(),
+            vec![Entry {
+                entry_type: EntryType::EntryNormal,
+                term: 1,
+                index: 3,
+                data: encoding.serialize(&kv_op2).unwrap().into(),
+                context: Default::default(),
+            }]
+        );
+
+        assert_eq!(backend.term(3).unwrap(), 1);
+
+        assert_eq!(
+            backend.initial_hard_state().unwrap(),
+            HardState {
+                term: 2,
+                vote: 0,
+                commit: 2,
+            }
+        );
+
+        assert_eq!(
+            backend.initial_config_state().unwrap(),
+            ConfigState {
+                voters: vec![1],
+                ..Default::default()
+            }
+        );
     }
 }

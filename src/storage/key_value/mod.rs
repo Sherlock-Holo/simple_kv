@@ -83,13 +83,13 @@ impl TryFrom<u8> for Operation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyValueOperation {
-    operation: Operation,
-    key: String,
-    value: Bytes,
+    pub operation: Operation,
+    pub key: Bytes,
+    pub value: Bytes,
 }
 
 impl KeyValueOperation {
-    pub fn new(operation: Operation, key: String, value: Bytes) -> Self {
+    pub fn new(operation: Operation, key: Bytes, value: Bytes) -> Self {
         Self {
             operation,
             key,
@@ -100,12 +100,12 @@ impl KeyValueOperation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyValuePair {
-    key: String,
-    value: Bytes,
+    pub key: Bytes,
+    pub value: Bytes,
 }
 
 impl KeyValuePair {
-    pub fn new(key: String, value: Bytes) -> Self {
+    pub fn new(key: Bytes, value: Bytes) -> Self {
         Self { key, value }
     }
 
@@ -145,13 +145,13 @@ pub trait KeyValueDatabaseBackend {
     ) -> Result<(), Self::Error>;
 
     /// get the value by key
-    fn get(&mut self, key: &str) -> Result<Option<Bytes>, Self::Error>;
+    fn get(&mut self, key: &Bytes) -> Result<Option<Bytes>, Self::Error>;
 
     // we use the KeyValuePair.key(String) to implement the PartialEq and Hash
     #[allow(clippy::mutable_key_type)]
     /// apply the key value pairs to the backend, before it, make sure clear the original all key
     /// value pairs
-    fn apply_key_value_pairs(&self, pairs: HashSet<KeyValuePair>) -> Result<(), Self::Error>;
+    fn apply_key_value_pairs(&mut self, pairs: HashSet<KeyValuePair>) -> Result<(), Self::Error>;
 
     /// get all key value pairs
     fn all(&self) -> Result<Vec<KeyValuePair>, Self::Error>;
