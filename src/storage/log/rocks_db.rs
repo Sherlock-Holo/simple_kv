@@ -3,12 +3,12 @@ use std::io::ErrorKind;
 
 use bincode::config::{BigEndian, VarintEncoding, WithOtherEndian, WithOtherIntEncoding};
 use bincode::{DefaultOptions, Options};
-use bytes::buf::Writer;
 use bytes::{BufMut, BytesMut};
 use raft::{Error, StorageError};
-use rocksdb::{ColumnFamily, Direction, IteratorMode, WriteBatch, DB};
+use rocksdb::{ColumnFamily, WriteBatch, DB};
 use tracing::{error, info};
 
+use crate::storage::key_value::KeyValueDatabaseBackend;
 use crate::storage::log::{ConfigState, Entry, HardState, LogBackend, Snapshot, SnapshotMetadata};
 
 type DataEncoding =
@@ -42,12 +42,14 @@ pub struct RocksdbBackend {
 impl RocksdbBackend {
     fn apply_hard_state_with_batch(
         &mut self,
-        hard_state: HardState,
+        hard_state: &HardState,
         batch: Option<&mut WriteBatch>,
-        encode_buf: &mut Writer<BytesMut>,
+        encode_buf: &mut BytesMut,
     ) -> Result<(), Error> {
+        let mut encode_buf = encode_buf.writer();
+
         self.data_encoding
-            .serialize_into(encode_buf, &hard_state)
+            .serialize_into(&mut encode_buf, hard_state)
             .map_err(|err| {
                 error!(%err, ?hard_state, "serialize hard state failed");
 
@@ -56,20 +58,65 @@ impl RocksdbBackend {
 
         info!(?hard_state, "serialize hard state done");
 
-        let hard_state = encode_buf.get_mut().split();
+        let hard_state_data = encode_buf.get_mut().split();
 
         match batch {
-            None => self.db.put(HARD_STATE_PATH, hard_state).map_err(|err| {
-                error!(%err, ?hard_state, "insert hard state to rocksdb failed");
+            None => self
+                .db
+                .put(HARD_STATE_PATH, hard_state_data)
+                .map_err(|err| {
+                    error!(%err, ?hard_state, "insert hard state failed");
 
-                Error::Io(io::Error::new(ErrorKind::Other, err))
-            }),
+                    Error::Io(io::Error::new(ErrorKind::Other, err))
+                }),
 
-            Some(batch) => batch.put(HARD_STATE_PATH, hard_state).map_err(|err| {
-                error!(%err, ?hard_state, "insert hard state to rocksdb failed");
+            Some(batch) => {
+                batch.put(HARD_STATE_PATH, hard_state_data);
 
-                Error::Io(io::Error::new(ErrorKind::Other, err))
-            }),
+                info!(?hard_state, "insert hard state to write batch done");
+
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_config_state_with_batch(
+        &mut self,
+        config_state: &ConfigState,
+        batch: Option<&mut WriteBatch>,
+        encode_buf: &mut BytesMut,
+    ) -> Result<(), Error> {
+        let mut encode_buf = encode_buf.writer();
+
+        self.data_encoding
+            .serialize_into(&mut encode_buf, config_state)
+            .map_err(|err| {
+                error!(%err, ?config_state, "serialize config state failed");
+
+                Error::Store(StorageError::Other(err))
+            })?;
+
+        info!(?config_state, "serialize config state done");
+
+        let hard_state_data = encode_buf.get_mut().split();
+
+        match batch {
+            None => self
+                .db
+                .put(CONFIG_STATE_PATH, hard_state_data)
+                .map_err(|err| {
+                    error!(%err, ?config_state, "insert config state failed");
+
+                    Error::Io(io::Error::new(ErrorKind::Other, err))
+                }),
+
+            Some(batch) => {
+                batch.put(CONFIG_STATE_PATH, hard_state_data);
+
+                info!(?config_state, "insert config state to write batch done");
+
+                Ok(())
+            }
         }
     }
 
@@ -84,9 +131,9 @@ impl RocksdbBackend {
             None => {
                 error!("snapshot metadata is not exist");
 
-                return Err(Error::ConfigInvalid(
+                Err(Error::ConfigInvalid(
                     "snapshot metadata is not exist".to_string(),
-                ));
+                ))
             }
 
             Some(metadata) => self.data_encoding.deserialize(&metadata).map_err(|err| {
@@ -195,7 +242,7 @@ impl LogBackend for RocksdbBackend {
 
             info!(entry_index, %entry_path, "insert entry path");
 
-            write_batch.put_cf(column_family_handle, entry_path, entry);
+            write_batch.put_cf(column_family_handle, &entry_path, entry);
 
             info!(entry_index, %entry_path, "insert entry in write batch done");
         }
@@ -215,8 +262,6 @@ impl LogBackend for RocksdbBackend {
         write_batch.put(LAST_INDEX_PATH, last_index);
 
         self.db.write(write_batch).map_err(|err| {
-            error!(%err, "delete will be covered entries failed, append entries failed or update last index failed");
-
             error!(%err, "the whole append entries operation failed");
 
             Error::Store(StorageError::Other(err.into()))
@@ -230,36 +275,120 @@ impl LogBackend for RocksdbBackend {
     }
 
     fn apply_config_state(&mut self, config_state: ConfigState) -> Result<(), Self::Error> {
-        todo!()
+        self.apply_config_state_with_batch(&config_state, None, &mut BytesMut::new())
     }
 
     fn apply_hard_state(&mut self, hard_state: HardState) -> Result<(), Self::Error> {
-        todo!()
+        self.apply_hard_state_with_batch(&hard_state, None, &mut BytesMut::new())
     }
 
     fn apply_commit_index(&mut self, commit_index: u64) -> Result<(), Self::Error> {
-        todo!()
+        let mut hard_state = self.initial_hard_state()?;
+
+        info!(?hard_state, "get hard state done");
+
+        hard_state.commit = commit_index;
+
+        self.apply_hard_state(hard_state.clone())?;
+
+        info!(new_hard_state = ?hard_state, "apply new hard state done");
+
+        Ok(())
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), Self::Error> {
-        let index = snapshot.metadata.index;
+        let snapshot_index = snapshot.metadata.index;
         let snapshot_term = snapshot.metadata.term;
 
         let first_index = self.first_index()?;
 
-        if first_index > index {
-            error!(
-                snapshot_index = index,
-                first_index, "first index > snapshot index"
-            );
+        info!(first_index, "get first index done");
+
+        let last_index = self.last_index()?;
+
+        info!(last_index, "get last index done");
+
+        if first_index > snapshot_index {
+            error!(snapshot_index, first_index, "first index > snapshot index");
 
             return Err(Error::Store(StorageError::SnapshotOutOfDate));
         }
 
         let mut hard_state = self.initial_hard_state()?;
 
-        hard_state.commit = index;
+        hard_state.commit = snapshot_index;
         hard_state.term = hard_state.term.max(snapshot_term);
+
+        let Snapshot {
+            data: snapshot_data,
+            metadata: snapshot_metadata,
+        } = snapshot;
+
+        let mut write_batch = WriteBatch::default();
+        let mut buf = BytesMut::with_capacity(snapshot_data.len());
+
+        self.apply_hard_state_with_batch(&hard_state, Some(&mut write_batch), &mut buf)?;
+
+        info!(new_hard_state = ?hard_state, "insert new hard state to write batch done");
+
+        let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
+
+        info!("get entries column family handle done");
+
+        for delete_index in first_index..=snapshot_index {
+            let delete_entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, delete_index);
+
+            info!(delete_index, %delete_entry_path, "delete entry path");
+
+            write_batch.delete_cf(column_family_handle, &delete_entry_path);
+
+            info!(delete_index, %delete_entry_path, "delete entry to write batch done");
+        }
+
+        self.data_encoding
+            .serialize_into((&mut buf).writer(), &snapshot_metadata)
+            .map_err(|err| {
+                error!(%err, ?snapshot_metadata, "serialize snapshot metadata failed");
+
+                Error::Store(StorageError::Other(err))
+            })?;
+
+        info!(?snapshot_metadata, "serialize snapshot metadata done");
+
+        let snapshot_metadata_data = buf.split();
+
+        write_batch.put(SNAPSHOT_METADATA_PATH, snapshot_metadata_data);
+
+        info!(
+            ?snapshot_metadata,
+            "insert snapshot metadata to write batch done"
+        );
+
+        self.data_encoding
+            .serialize_into((&mut buf).writer(), &snapshot_data)
+            .map_err(|err| {
+                error!(%err, "serialize snapshot data failed");
+
+                Error::Store(StorageError::Other(err))
+            })?;
+
+        info!("serialize snapshot data done");
+
+        let snapshot_data_data = buf.split();
+
+        write_batch.put(SNAPSHOT_DATA_PATH, snapshot_data_data);
+
+        info!("insert snapshot data to write batch done");
+
+        self.db.write(write_batch).map_err(|err| {
+            error!(%err, "the whole apply snapshot operation failed");
+
+            Error::Io(io::Error::new(ErrorKind::Other, err))
+        })?;
+
+        info!("insert new hard state done, delete compacted entries done, insert snapshot metadata done and insert snapshot data done");
+
+        Ok(())
     }
 
     fn initial_hard_state(&self) -> Result<HardState, Self::Error> {
@@ -508,7 +637,146 @@ impl LogBackend for RocksdbBackend {
         }
     }
 
-    fn snapshot(&self, request_index: u64) -> Result<Snapshot, Self::Error> {
-        todo!()
+    fn snapshot<KV: KeyValueDatabaseBackend>(
+        &self,
+        request_index: u64,
+        backend: &KV,
+    ) -> Result<Snapshot, Self::Error> {
+        let snapshot_metadata = self.get_snapshot_metadata()?;
+
+        info!("get snapshot metadata done");
+
+        if snapshot_metadata.index == request_index {
+            info!(
+                request_index,
+                snapshot_index = snapshot_metadata.index,
+                "request index == snapshot index"
+            );
+
+            let snapshot_data = self.db.get(SNAPSHOT_DATA_PATH).map_err(|err| {
+                error!(%err, "get snapshot data failed");
+
+                Error::Store(StorageError::Other(err.into()))
+            })?;
+
+            return match snapshot_data {
+                None => {
+                    error!("snapshot data not exists");
+
+                    Err(Error::Store(StorageError::Other(
+                        "snapshot data not exist".into(),
+                    )))
+                }
+
+                Some(snapshot_data) => Ok(Snapshot {
+                    data: snapshot_data.into(),
+                    metadata: snapshot_metadata,
+                }),
+            };
+        }
+
+        let hard_state = self.initial_hard_state()?;
+
+        info!(?hard_state, "get hard state done");
+
+        if request_index > hard_state.commit {
+            error!(
+                request_index,
+                commit_index = hard_state.commit,
+                "request index > commit index"
+            );
+
+            return Err(Error::Store(StorageError::Other(
+                format!(
+                    "request index {} > commit index {}",
+                    request_index, hard_state.commit
+                )
+                .into(),
+            )));
+        }
+
+        let first_index = self.first_index()?;
+
+        info!(first_index, "get first index done");
+
+        let mut write_batch = WriteBatch::default();
+
+        let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
+
+        info!("get entry column family handle done");
+
+        for delete_index in first_index..=hard_state.commit {
+            let delete_entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, delete_index);
+
+            info!(delete_index, %delete_entry_path, "delete entry path");
+
+            write_batch.delete_cf(column_family_handle, &delete_entry_path);
+
+            info!(delete_index, %delete_entry_path, "delete entry to write batch done");
+        }
+
+        let mut buf = BytesMut::with_capacity(4096).writer();
+
+        let new_snapshot_metadata = SnapshotMetadata {
+            config_state: snapshot_metadata.config_state,
+            index: hard_state.commit,
+            term: hard_state.term,
+        };
+
+        self.data_encoding
+            .serialize_into(&mut buf, &new_snapshot_metadata)
+            .map_err(|err| {
+                error!(%err, "serialize new snapshot metadata failed");
+
+                Error::Store(StorageError::Other(err))
+            })?;
+
+        info!(
+            ?new_snapshot_metadata,
+            "serialize new snapshot metadata done"
+        );
+
+        let new_snapshot_metadata_data = buf.get_mut().split();
+
+        write_batch.put(SNAPSHOT_METADATA_PATH, new_snapshot_metadata_data);
+
+        info!("insert new snapshot metadata to write batch done");
+
+        let key_value_pairs = backend.all().map_err(|err| {
+            error!(%err, "get all key value pairs failed");
+
+            Error::Store(StorageError::Other(err.into()))
+        })?;
+
+        info!("get all key value pairs done");
+
+        self.data_encoding
+            .serialize_into(&mut buf, &key_value_pairs)
+            .map_err(|err| {
+                error!(%err, "serialize all key value pairs failed");
+
+                Error::Store(StorageError::Other(err))
+            })?;
+
+        info!("serialize all key value pairs to snapshot data done");
+
+        let new_snapshot_data = buf.into_inner().freeze();
+
+        write_batch.put(SNAPSHOT_DATA_PATH, new_snapshot_data.clone());
+
+        info!("insert new snapshot data to write batch done");
+
+        self.db.write(write_batch).map_err(|err| {
+            error!(%err, "the whole update snapshot operation failed");
+
+            Error::Io(io::Error::new(ErrorKind::Other, err))
+        })?;
+
+        info!("the whole update snapshot operation done");
+
+        Ok(Snapshot {
+            data: new_snapshot_data,
+            metadata: new_snapshot_metadata,
+        })
     }
 }

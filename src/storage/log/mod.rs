@@ -7,6 +7,8 @@ use serde::de::{Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+use super::key_value::KeyValueDatabaseBackend;
+
 mod rocks_db;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -264,5 +266,9 @@ pub trait LogBackend {
     /// so raft state machine could know that Storage needs some time to prepare
     /// snapshot and call snapshot later.
     /// A snapshot's index must not less than the `request_index`.
-    fn snapshot(&self, request_index: u64) -> Result<Snapshot, Self::Error>;
+    fn snapshot<KV: KeyValueDatabaseBackend>(
+        &self,
+        request_index: u64,
+        backend: &KV,
+    ) -> Result<Snapshot, Self::Error>;
 }
