@@ -38,6 +38,16 @@ impl From<eraftpb::EntryType> for EntryType {
     }
 }
 
+impl From<EntryType> for eraftpb::EntryType {
+    fn from(et: EntryType) -> Self {
+        match et {
+            EntryType::EntryNormal => eraftpb::EntryType::EntryNormal,
+            EntryType::EntryConfChange => eraftpb::EntryType::EntryConfChange,
+            EntryType::EntryConfChangeV2 => eraftpb::EntryType::EntryConfChangeV2,
+        }
+    }
+}
+
 impl Serialize for EntryType {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -93,7 +103,7 @@ impl TryFrom<i32> for EntryType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub entry_type: EntryType,
     pub term: u64,
@@ -115,6 +125,19 @@ impl TryFrom<eraftpb::Entry> for Entry {
             data: entry.data.into(),
             context: entry.context.into(),
         })
+    }
+}
+
+impl From<Entry> for eraftpb::Entry {
+    fn from(e: Entry) -> Self {
+        Self {
+            entry_type: e.entry_type.into(),
+            term: e.term,
+            index: e.index,
+            data: e.data.to_vec(),
+            context: e.context.to_vec(),
+            sync_log: false,
+        }
     }
 }
 
@@ -148,6 +171,18 @@ impl From<eraftpb::ConfState> for ConfigState {
     }
 }
 
+impl From<ConfigState> for eraftpb::ConfState {
+    fn from(c: ConfigState) -> Self {
+        Self {
+            voters: c.voters,
+            learners: c.learners,
+            voters_outgoing: c.voters_outgoing,
+            learners_next: c.learners_next,
+            auto_leave: c.auto_leave,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardState {
     pub term: u64,
@@ -161,6 +196,16 @@ impl From<eraftpb::HardState> for HardState {
             term: hard_state.term,
             vote: hard_state.vote,
             commit: hard_state.commit,
+        }
+    }
+}
+
+impl From<HardState> for eraftpb::HardState {
+    fn from(h: HardState) -> Self {
+        Self {
+            term: h.term,
+            vote: h.vote,
+            commit: h.commit,
         }
     }
 }
@@ -187,7 +232,17 @@ impl From<eraftpb::SnapshotMetadata> for SnapshotMetadata {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+impl From<SnapshotMetadata> for eraftpb::SnapshotMetadata {
+    fn from(m: SnapshotMetadata) -> Self {
+        Self {
+            conf_state: m.config_state.map(Into::into),
+            index: m.index,
+            term: m.term,
+        }
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub data: Bytes,
     pub metadata: SnapshotMetadata,
@@ -205,6 +260,15 @@ impl TryFrom<eraftpb::Snapshot> for Snapshot {
             data: snapshot.data.into(),
             metadata: snapshot.metadata.ok_or(SnapshotError(()))?.into(),
         })
+    }
+}
+
+impl From<Snapshot> for eraftpb::Snapshot {
+    fn from(s: Snapshot) -> Self {
+        Self {
+            data: s.data.to_vec(),
+            metadata: Some(s.metadata.into()),
+        }
     }
 }
 
