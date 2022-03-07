@@ -103,7 +103,7 @@ impl TryFrom<i32> for EntryType {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub entry_type: EntryType,
     pub term: u64,
