@@ -12,7 +12,7 @@ use tap::TapFallible;
 use tracing::{error, info, warn};
 
 use crate::reply::{GetRequestReply, ProposalRequestReply};
-use crate::storage::key_value::{KeyValueDatabaseBackend, KeyValueOperation};
+use crate::storage::key_value::{KeyValueBackend, KeyValueOperation};
 use crate::storage::log::{ConfigState, Entry, EntryType, LogBackend, Snapshot};
 
 pub struct NodeBuilder<'a, KV, ST> {
@@ -99,7 +99,7 @@ impl<'a, KV, ST> NodeBuilder<'a, KV, ST> {
 
 impl<'a, KV, ST> NodeBuilder<'a, KV, ST>
 where
-    KV: KeyValueDatabaseBackend,
+    KV: KeyValueBackend,
     ST: Storage + LogBackend,
 {
     pub fn build(&mut self) -> anyhow::Result<Node<KV, ST>> {
@@ -157,7 +157,7 @@ where
 
 pub struct Node<KV, ST>
 where
-    KV: KeyValueDatabaseBackend,
+    KV: KeyValueBackend,
     ST: Storage + LogBackend,
 {
     mailbox: Receiver<eraftpb::Message>,
@@ -182,7 +182,7 @@ impl<KV, ST> Node<KV, ST>
 where
     ST: Storage + LogBackend,
     ST::Error: Send + Sync + 'static,
-    KV: KeyValueDatabaseBackend,
+    KV: KeyValueBackend,
     KV::Error: Into<raft::Error>,
 {
     pub fn run(&mut self) -> anyhow::Result<()> {
@@ -272,9 +272,7 @@ where
 
                 info!("convert rpc snapshot to log snapshot done");
 
-                self.raw_node
-                    .mut_store()
-                    .apply_snapshot(snapshot, &mut self.key_value_backend)?;
+                self.raw_node.mut_store().apply_snapshot(snapshot)?;
 
                 info!("apply snapshot done");
             }

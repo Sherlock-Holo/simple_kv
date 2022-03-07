@@ -137,7 +137,7 @@ impl Hash for KeyValuePair {
     }
 }
 
-pub trait KeyValueDatabaseBackend {
+pub trait KeyValueBackend {
     type Error: Error + Send + Sync + 'static;
 
     /// apply the key value operation to the database backend

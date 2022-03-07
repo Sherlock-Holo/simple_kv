@@ -5,12 +5,12 @@ use std::path::Path;
 use bincode::config::{BigEndian, VarintEncoding, WithOtherEndian, WithOtherIntEncoding};
 use bincode::{DefaultOptions, Options};
 use bytes::{BufMut, BytesMut};
-use raft::{Error, StorageError};
+use raft::{eraftpb, Error, RaftState, Storage, StorageError};
 use rocksdb::{ColumnFamily, WriteBatch, DB};
 use tap::TapFallible;
 use tracing::{error, info};
 
-use crate::storage::key_value::{KeyValueDatabaseBackend, KeyValuePair};
+use crate::storage::key_value::{KeyValueBackend, KeyValuePair};
 use crate::storage::log::{ConfigState, Entry, HardState, LogBackend, Snapshot, SnapshotMetadata};
 
 type DataEncoding =
@@ -36,13 +36,22 @@ const LAST_INDEX_PATH: &str = "kv_core/last_index";
 ///
 /// The entry index is continuous, but may not start from 1, because the entries can be compressed
 /// to a snapshot
-pub struct RocksdbBackend {
+pub struct RocksdbBackend<KV> {
     db: DB,
+    kv_backend: KV,
     data_encoding: DataEncoding,
 }
 
-impl RocksdbBackend {
-    pub fn from_exist(db_path: &Path, config_state: ConfigState) -> anyhow::Result<Self> {
+impl<KV> RocksdbBackend<KV>
+where
+    KV: KeyValueBackend,
+    KV::Error: Into<Error>,
+{
+    pub fn from_exist(
+        db_path: &Path,
+        config_state: ConfigState,
+        kv_backend: KV,
+    ) -> anyhow::Result<Self> {
         let db = DB::open_cf(
             &rocksdb::Options::default(),
             db_path,
@@ -58,7 +67,11 @@ impl RocksdbBackend {
             .with_big_endian()
             .with_varint_encoding();
 
-        let mut backend = Self { db, data_encoding };
+        let mut backend = Self {
+            db,
+            kv_backend,
+            data_encoding,
+        };
 
         backend
             .apply_config_state(config_state.clone())
@@ -71,7 +84,7 @@ impl RocksdbBackend {
         Ok(backend)
     }
 
-    pub fn create(path: &Path, config_state: ConfigState) -> anyhow::Result<Self> {
+    pub fn create(path: &Path, config_state: ConfigState, kv_backend: KV) -> anyhow::Result<Self> {
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
@@ -127,7 +140,11 @@ impl RocksdbBackend {
 
         info!("init rocksdb done");
 
-        Ok(RocksdbBackend { db, data_encoding })
+        Ok(RocksdbBackend {
+            db,
+            kv_backend,
+            data_encoding,
+        })
     }
 
     fn apply_hard_state_with_batch(
@@ -244,11 +261,7 @@ impl RocksdbBackend {
         Ok(column_family_handle)
     }
 
-    fn create_snapshot<KV: KeyValueDatabaseBackend>(
-        &self,
-        request_index: u64,
-        backend: &KV,
-    ) -> Result<Snapshot, Error> {
+    fn create_snapshot(&self, request_index: u64) -> Result<Snapshot, Error> {
         let hard_state = self.initial_hard_state()?;
 
         info!(?hard_state, "get hard state done");
@@ -320,10 +333,10 @@ impl RocksdbBackend {
 
         info!("insert new snapshot metadata to write batch done");
 
-        let key_value_pairs = backend.all().map_err(|err| {
+        let key_value_pairs = self.kv_backend.all().map_err(|err| {
             error!(%err, "get all key value pairs failed");
 
-            Error::Store(StorageError::Other(err.into()))
+            Error::Store(StorageError::Other(err.into().into()))
         })?;
 
         info!("get all key value pairs done");
@@ -357,9 +370,82 @@ impl RocksdbBackend {
             metadata: new_snapshot_metadata,
         })
     }
+
+    fn initial_hard_state(&self) -> Result<HardState, Error> {
+        let hard_state = self.db.get_pinned(HARD_STATE_PATH).map_err(|err| {
+            error!(%err, "get hard state failed");
+
+            Error::Store(StorageError::Other(err.into()))
+        })?;
+
+        let hard_state = match hard_state {
+            None => {
+                error!("an initial rocks db has no hard state");
+
+                return Err(Error::ConfigInvalid(
+                    "an initial rocks db has no hard state".to_string(),
+                ));
+            }
+
+            Some(hard_state) => {
+                let hard_state: HardState =
+                    self.data_encoding.deserialize(&hard_state).map_err(|err| {
+                        error!(%err, "deserialize hard state data failed");
+
+                        Error::ConfigInvalid(format!("deserialize hard state data failed: {}", err))
+                    })?;
+
+                info!(?hard_state, "deserialize hard state done");
+
+                hard_state
+            }
+        };
+
+        Ok(hard_state)
+    }
+
+    fn initial_config_state(&self) -> Result<ConfigState, Error> {
+        let config_state = self.db.get_pinned(CONFIG_STATE_PATH).map_err(|err| {
+            error!(%err, "get config state failed");
+
+            Error::Store(StorageError::Other(err.into()))
+        })?;
+
+        let config_state = match config_state {
+            None => {
+                error!("an initial rocks db has no config state");
+
+                return Err(Error::ConfigInvalid(
+                    "an initial rocks db has no config state".to_string(),
+                ));
+            }
+
+            Some(hard_state) => {
+                let config_state: ConfigState =
+                    self.data_encoding.deserialize(&hard_state).map_err(|err| {
+                        error!(%err, "deserialize config state data failed");
+
+                        Error::ConfigInvalid(format!(
+                            "deserialize config state data failed: {}",
+                            err
+                        ))
+                    })?;
+
+                info!(?config_state, "deserialize config state done");
+
+                config_state
+            }
+        };
+
+        Ok(config_state)
+    }
 }
 
-impl LogBackend for RocksdbBackend {
+impl<KV> LogBackend for RocksdbBackend<KV>
+where
+    KV: KeyValueBackend,
+    KV::Error: Into<Error>,
+{
     type Error = Error;
 
     fn append_entries(&mut self, entries: Vec<Entry>) -> Result<(), Self::Error> {
@@ -510,14 +596,7 @@ impl LogBackend for RocksdbBackend {
         Ok(())
     }
 
-    fn apply_snapshot<KV: KeyValueDatabaseBackend>(
-        &mut self,
-        snapshot: Snapshot,
-        backend: &mut KV,
-    ) -> Result<(), Self::Error>
-    where
-        KV::Error: Into<raft::Error>,
-    {
+    fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), Self::Error> {
         let snapshot_index = snapshot.metadata.index;
         let snapshot_term = snapshot.metadata.term;
 
@@ -614,7 +693,7 @@ impl LogBackend for RocksdbBackend {
 
         info!("insert new hard state done, delete compacted entries done, insert snapshot metadata done and insert snapshot data done");
 
-        backend
+        self.kv_backend
             .apply_key_value_pairs(key_value_pairs.into_iter().collect())
             .map_err(Into::into)?;
 
@@ -622,89 +701,41 @@ impl LogBackend for RocksdbBackend {
 
         Ok(())
     }
+}
 
-    fn initial_hard_state(&self) -> Result<HardState, Self::Error> {
-        let hard_state = self.db.get_pinned(HARD_STATE_PATH).map_err(|err| {
-            error!(%err, "get hard state failed");
+impl<KV> Storage for RocksdbBackend<KV>
+where
+    KV: KeyValueBackend,
+    KV::Error: Into<Error>,
+{
+    fn initial_state(&self) -> raft::Result<RaftState> {
+        let hard_state = self.initial_hard_state()?;
 
-            Error::Store(StorageError::Other(err.into()))
-        })?;
+        info!(?hard_state, "get initial hard state done");
 
-        let hard_state = match hard_state {
-            None => {
-                error!("an initial rocks db has no hard state");
+        let config_state = self.initial_config_state()?;
 
-                return Err(Error::ConfigInvalid(
-                    "an initial rocks db has no hard state".to_string(),
-                ));
-            }
+        info!(?config_state, "get initial config state done");
 
-            Some(hard_state) => {
-                let hard_state: HardState =
-                    self.data_encoding.deserialize(&hard_state).map_err(|err| {
-                        error!(%err, "deserialize hard state data failed");
-
-                        Error::ConfigInvalid(format!("deserialize hard state data failed: {}", err))
-                    })?;
-
-                info!(?hard_state, "deserialize hard state done");
-
-                hard_state
-            }
-        };
-
-        Ok(hard_state)
-    }
-
-    fn initial_config_state(&self) -> Result<ConfigState, Self::Error> {
-        let config_state = self.db.get_pinned(CONFIG_STATE_PATH).map_err(|err| {
-            error!(%err, "get config state failed");
-
-            Error::Store(StorageError::Other(err.into()))
-        })?;
-
-        let config_state = match config_state {
-            None => {
-                error!("an initial rocks db has no config state");
-
-                return Err(Error::ConfigInvalid(
-                    "an initial rocks db has no config state".to_string(),
-                ));
-            }
-
-            Some(hard_state) => {
-                let config_state: ConfigState =
-                    self.data_encoding.deserialize(&hard_state).map_err(|err| {
-                        error!(%err, "deserialize config state data failed");
-
-                        Error::ConfigInvalid(format!(
-                            "deserialize config state data failed: {}",
-                            err
-                        ))
-                    })?;
-
-                info!(?config_state, "deserialize config state done");
-
-                config_state
-            }
-        };
-
-        Ok(config_state)
+        Ok(RaftState {
+            hard_state: hard_state.into(),
+            conf_state: config_state.into(),
+        })
     }
 
     fn entries(
         &self,
         low: u64,
         high: u64,
-        max_size: Option<u64>,
-    ) -> Result<Vec<Entry>, Self::Error> {
+        max_size: impl Into<Option<u64>>,
+    ) -> raft::Result<Vec<eraftpb::Entry>> {
         let last_index = self.last_index()?;
 
         info!(last_index, "get last index done");
 
         assert!(high <= last_index + 1);
 
-        let max_size = max_size.unwrap_or(u64::MAX);
+        let max_size = max_size.into().unwrap_or(u64::MAX);
 
         let first_index = self.first_index()?;
 
@@ -770,7 +801,7 @@ impl LogBackend for RocksdbBackend {
 
             info!(index, %entry_path, "get entry done");
 
-            entries.push(entry);
+            entries.push(entry.into());
         }
 
         info!(low, high, max_size, total_size, "get entries done");
@@ -778,7 +809,7 @@ impl LogBackend for RocksdbBackend {
         Ok(entries)
     }
 
-    fn term(&self, idx: u64) -> Result<u64, Self::Error> {
+    fn term(&self, idx: u64) -> raft::Result<u64> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
         info!(?snapshot_metadata, "get snapshot metadata done");
@@ -832,7 +863,7 @@ impl LogBackend for RocksdbBackend {
         Ok(entry.term)
     }
 
-    fn first_index(&self) -> Result<u64, Self::Error> {
+    fn first_index(&self) -> raft::Result<u64> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
         info!(?snapshot_metadata, "get snapshot metadata done");
@@ -841,7 +872,7 @@ impl LogBackend for RocksdbBackend {
         Ok(snapshot_metadata.index + 1)
     }
 
-    fn last_index(&self) -> Result<u64, Self::Error> {
+    fn last_index(&self) -> raft::Result<u64> {
         let last_index = self.db.get_pinned(LAST_INDEX_PATH).map_err(|err| {
             error!(%err, "get last index path failed");
 
@@ -867,14 +898,7 @@ impl LogBackend for RocksdbBackend {
         }
     }
 
-    fn snapshot<KV: KeyValueDatabaseBackend>(
-        &self,
-        request_index: u64,
-        backend: &KV,
-    ) -> Result<Snapshot, Self::Error>
-    where
-        KV::Error: Into<raft::Error>,
-    {
+    fn snapshot(&self, request_index: u64) -> raft::Result<eraftpb::Snapshot> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
         info!("get snapshot metadata done");
@@ -901,21 +925,23 @@ impl LogBackend for RocksdbBackend {
                     )))
                 }
 
-                Some(snapshot_data) => Ok(Snapshot {
-                    data: snapshot_data.into(),
-                    metadata: snapshot_metadata,
+                Some(snapshot_data) => Ok(eraftpb::Snapshot {
+                    data: snapshot_data,
+                    metadata: Some(snapshot_metadata.into()),
                 }),
             };
         }
 
-        self.create_snapshot(request_index, backend)
+        self.create_snapshot(request_index).map(Into::into)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
     use std::env;
+    use std::rc::Rc;
 
     use bytes::Bytes;
     use once_cell::sync::OnceCell;
@@ -947,12 +973,27 @@ mod tests {
             .with_varint_encoding()
     }
 
-    fn create_backend(path: &Path) -> RocksdbBackend {
+    fn create_backend(path: &Path) -> RocksdbBackend<TestKVBackend> {
         create_backend_with_config_state(path, Default::default())
     }
 
-    fn create_backend_with_config_state(path: &Path, config_state: ConfigState) -> RocksdbBackend {
-        RocksdbBackend::create(path, config_state).unwrap()
+    fn create_backend_with_config_state(
+        path: &Path,
+        config_state: ConfigState,
+    ) -> RocksdbBackend<TestKVBackend> {
+        RocksdbBackend::create(path, config_state, TestKVBackend::default()).unwrap()
+    }
+
+    fn create_backend_with_kv_backend_and_config_state<KV>(
+        path: &Path,
+        config_state: ConfigState,
+        kv: KV,
+    ) -> RocksdbBackend<KV>
+    where
+        KV: KeyValueBackend,
+        KV::Error: Into<Error>,
+    {
+        RocksdbBackend::create(path, config_state, kv).unwrap()
     }
 
     #[test]
@@ -970,7 +1011,12 @@ mod tests {
         let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
         create_backend(tmp_dir.path());
 
-        RocksdbBackend::from_exist(tmp_dir.path(), ConfigState::default()).unwrap();
+        RocksdbBackend::from_exist(
+            tmp_dir.path(),
+            ConfigState::default(),
+            TestKVBackend::default(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1252,7 +1298,12 @@ mod tests {
             ])
             .unwrap();
 
-        let mut entries = backend.entries(1, 3, None).unwrap();
+        let entries = backend.entries(1, 3, None).unwrap();
+        let entries = entries
+            .into_iter()
+            .map(|entry| entry.try_into())
+            .collect::<Result<Vec<Entry>, _>>()
+            .unwrap();
 
         assert_eq!(
             entries,
@@ -1274,10 +1325,15 @@ mod tests {
             ]
         );
 
-        entries = backend.entries(1, 1, None).unwrap();
+        let entries = backend.entries(1, 1, None).unwrap();
         assert!(entries.is_empty());
 
-        entries = backend.entries(1, 2, None).unwrap();
+        let entries = backend.entries(1, 2, None).unwrap();
+        let entries = entries
+            .into_iter()
+            .map(|entry| entry.try_into())
+            .collect::<Result<Vec<Entry>, _>>()
+            .unwrap();
         assert_eq!(
             entries,
             vec![Entry {
@@ -1289,7 +1345,12 @@ mod tests {
             }]
         );
 
-        entries = backend.entries(2, 3, None).unwrap();
+        let entries = backend.entries(2, 3, None).unwrap();
+        let entries = entries
+            .into_iter()
+            .map(|entry| entry.try_into())
+            .collect::<Result<Vec<Entry>, _>>()
+            .unwrap();
         assert_eq!(
             entries,
             vec![Entry {
@@ -1302,12 +1363,12 @@ mod tests {
         )
     }
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct TestKVBackend {
-        map: HashMap<Bytes, Bytes>,
+        map: Rc<RefCell<HashMap<Bytes, Bytes>>>,
     }
 
-    impl KeyValueDatabaseBackend for TestKVBackend {
+    impl KeyValueBackend for TestKVBackend {
         type Error = raft::Error;
 
         fn apply_key_value_operation(
@@ -1317,10 +1378,10 @@ mod tests {
             for operation in operations {
                 match operation.operation {
                     Operation::InsertOrUpdate => {
-                        self.map.insert(operation.key, operation.value);
+                        self.map.borrow_mut().insert(operation.key, operation.value);
                     }
                     Operation::Delete => {
-                        self.map.remove(&operation.key);
+                        self.map.borrow_mut().remove(&operation.key);
                     }
                 }
             }
@@ -1329,17 +1390,17 @@ mod tests {
         }
 
         fn get<S: AsRef<[u8]>>(&mut self, key: S) -> Result<Option<Bytes>, Self::Error> {
-            Ok(self.map.get(key.as_ref()).cloned())
+            Ok(self.map.borrow_mut().get(key.as_ref()).cloned())
         }
 
         fn apply_key_value_pairs(
             &mut self,
             pairs: HashSet<KeyValuePair>,
         ) -> Result<(), Self::Error> {
-            self.map.clear();
+            self.map.borrow_mut().clear();
 
             for pair in pairs {
-                self.map.insert(pair.key, pair.value);
+                self.map.borrow_mut().insert(pair.key, pair.value);
             }
 
             Ok(())
@@ -1348,6 +1409,7 @@ mod tests {
         fn all(&self) -> Result<Vec<KeyValuePair>, Self::Error> {
             Ok(self
                 .map
+                .borrow()
                 .iter()
                 .map(|(key, value)| KeyValuePair::new(key.clone(), value.clone()))
                 .collect())
@@ -1358,8 +1420,14 @@ mod tests {
     fn test_snapshot() {
         init_log();
 
+        let mut kv_backend = TestKVBackend::default();
+
         let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
-        let mut backend = create_backend_with_config_state(tmp_dir.path(), ConfigState::default());
+        let mut backend = create_backend_with_kv_backend_and_config_state(
+            tmp_dir.path(),
+            ConfigState::default(),
+            kv_backend.clone(),
+        );
 
         let encoding = encoding();
 
@@ -1400,16 +1468,14 @@ mod tests {
 
         backend.apply_hard_state(hard_state).unwrap();
 
-        let mut kv_backend = TestKVBackend::default();
-
         kv_backend
             .apply_key_value_operation(vec![kv_op1, kv_op2])
             .unwrap();
 
-        let snapshot = backend.snapshot(2, &kv_backend).unwrap();
+        let snapshot = backend.snapshot(2).unwrap();
 
         assert_eq!(
-            snapshot.metadata,
+            SnapshotMetadata::from(snapshot.metadata.unwrap()),
             SnapshotMetadata {
                 config_state: Some(ConfigState::default()),
                 index: 2,
@@ -1504,15 +1570,20 @@ mod tests {
             },
         };
 
-        let mut kv_backend = TestKVBackend::default();
-
-        backend.apply_snapshot(snapshot, &mut kv_backend).unwrap();
+        backend.apply_snapshot(snapshot).unwrap();
 
         assert_eq!(backend.first_index().unwrap(), 3);
         assert_eq!(backend.last_index().unwrap(), 3);
 
+        let entries = backend.entries(3, 4, None).unwrap();
+        let entries = entries
+            .into_iter()
+            .map(|entry| entry.try_into())
+            .collect::<Result<Vec<Entry>, _>>()
+            .unwrap();
+
         assert_eq!(
-            backend.entries(3, 4, None).unwrap(),
+            entries,
             vec![Entry {
                 entry_type: EntryType::EntryNormal,
                 term: 1,

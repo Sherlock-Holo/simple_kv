@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use raft::StorageError;
@@ -8,9 +9,7 @@ use tap::TapFallible;
 use thiserror::Error;
 use tracing::{error, info};
 
-use crate::storage::key_value::{
-    KeyValueDatabaseBackend, KeyValueOperation, KeyValuePair, Operation,
-};
+use crate::storage::key_value::{KeyValueBackend, KeyValueOperation, KeyValuePair, Operation};
 
 #[derive(Debug, Error)]
 #[error("{0}")]
@@ -28,8 +27,9 @@ impl From<rocksdb::Error> for Error {
     }
 }
 
+#[derive(Clone)]
 pub struct RocksdbBackend {
-    db: DB,
+    db: Arc<DB>,
 }
 
 impl RocksdbBackend {
@@ -41,7 +41,7 @@ impl RocksdbBackend {
 
         info!(?path, "open exist rocksdb done");
 
-        Ok(RocksdbBackend { db })
+        Ok(RocksdbBackend { db: Arc::new(db) })
     }
 
     pub fn create(path: &Path) -> anyhow::Result<Self> {
@@ -53,11 +53,11 @@ impl RocksdbBackend {
 
         info!(?path, "create rocksdb done");
 
-        Ok(RocksdbBackend { db })
+        Ok(RocksdbBackend { db: Arc::new(db) })
     }
 }
 
-impl KeyValueDatabaseBackend for RocksdbBackend {
+impl KeyValueBackend for RocksdbBackend {
     type Error = Error;
 
     fn apply_key_value_operation(
