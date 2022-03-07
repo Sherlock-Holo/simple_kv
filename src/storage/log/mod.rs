@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use super::key_value::KeyValueDatabaseBackend;
 
-mod rocksdb;
+pub mod rocksdb;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EntryType {
@@ -252,13 +252,13 @@ pub struct Snapshot {
 #[error("snapshot metadata is none")]
 pub struct SnapshotError(());
 
-impl TryFrom<eraftpb::Snapshot> for Snapshot {
+impl TryFrom<&eraftpb::Snapshot> for Snapshot {
     type Error = SnapshotError;
 
-    fn try_from(snapshot: eraftpb::Snapshot) -> Result<Self, Self::Error> {
+    fn try_from(snapshot: &eraftpb::Snapshot) -> Result<Self, Self::Error> {
         Ok(Self {
-            data: snapshot.data.into(),
-            metadata: snapshot.metadata.ok_or(SnapshotError(()))?.into(),
+            data: Bytes::copy_from_slice(snapshot.data.as_slice()),
+            metadata: snapshot.metadata.clone().ok_or(SnapshotError(()))?.into(),
         })
     }
 }
@@ -283,7 +283,13 @@ pub trait LogBackend {
 
     fn apply_commit_index(&mut self, commit_index: u64) -> Result<(), Self::Error>;
 
-    fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), Self::Error>;
+    fn apply_snapshot<KV: KeyValueDatabaseBackend>(
+        &mut self,
+        snapshot: Snapshot,
+        backend: &mut KV,
+    ) -> Result<(), Self::Error>
+    where
+        KV::Error: Into<raft::Error>;
 
     /// `initial_hard_state` is called when Raft is initialized. This interface will return a
     /// `HardState`.
@@ -334,5 +340,7 @@ pub trait LogBackend {
         &self,
         request_index: u64,
         backend: &KV,
-    ) -> Result<Snapshot, Self::Error>;
+    ) -> Result<Snapshot, Self::Error>
+    where
+        KV::Error: Into<raft::Error>;
 }

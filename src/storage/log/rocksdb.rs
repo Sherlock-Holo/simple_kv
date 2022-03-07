@@ -510,7 +510,14 @@ impl LogBackend for RocksdbBackend {
         Ok(())
     }
 
-    fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), Self::Error> {
+    fn apply_snapshot<KV: KeyValueDatabaseBackend>(
+        &mut self,
+        snapshot: Snapshot,
+        backend: &mut KV,
+    ) -> Result<(), Self::Error>
+    where
+        KV::Error: Into<raft::Error>,
+    {
         let snapshot_index = snapshot.metadata.index;
         let snapshot_term = snapshot.metadata.term;
 
@@ -537,6 +544,17 @@ impl LogBackend for RocksdbBackend {
             data: snapshot_data,
             metadata: snapshot_metadata,
         } = snapshot;
+
+        let key_value_pairs: Vec<KeyValuePair> = self
+            .data_encoding
+            .deserialize(&snapshot_data)
+            .map_err(|err| {
+                error!(%err, "deserialize snapshot data failed");
+
+                Error::Store(StorageError::Other(err))
+            })?;
+
+        info!("deserialize snapshot data done");
 
         let mut write_batch = WriteBatch::default();
         let mut buf = BytesMut::with_capacity(snapshot_data.len());
@@ -584,19 +602,7 @@ impl LogBackend for RocksdbBackend {
             "insert snapshot metadata to write batch done"
         );
 
-        self.data_encoding
-            .serialize_into((&mut buf).writer(), &snapshot_data)
-            .map_err(|err| {
-                error!(%err, "serialize snapshot data failed");
-
-                Error::Store(StorageError::Other(err))
-            })?;
-
-        info!("serialize snapshot data done");
-
-        let snapshot_data_data = buf.split();
-
-        write_batch.put(SNAPSHOT_DATA_PATH, snapshot_data_data);
+        write_batch.put(SNAPSHOT_DATA_PATH, snapshot_data);
 
         info!("insert snapshot data to write batch done");
 
@@ -607,6 +613,12 @@ impl LogBackend for RocksdbBackend {
         })?;
 
         info!("insert new hard state done, delete compacted entries done, insert snapshot metadata done and insert snapshot data done");
+
+        backend
+            .apply_key_value_pairs(key_value_pairs.into_iter().collect())
+            .map_err(Into::into)?;
+
+        info!("apply key value pairs to key value backend done");
 
         Ok(())
     }
@@ -859,7 +871,10 @@ impl LogBackend for RocksdbBackend {
         &self,
         request_index: u64,
         backend: &KV,
-    ) -> Result<Snapshot, Self::Error> {
+    ) -> Result<Snapshot, Self::Error>
+    where
+        KV::Error: Into<raft::Error>,
+    {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
         info!("get snapshot metadata done");
@@ -1489,7 +1504,9 @@ mod tests {
             },
         };
 
-        backend.apply_snapshot(snapshot).unwrap();
+        let mut kv_backend = TestKVBackend::default();
+
+        backend.apply_snapshot(snapshot, &mut kv_backend).unwrap();
 
         assert_eq!(backend.first_index().unwrap(), 3);
         assert_eq!(backend.last_index().unwrap(), 3);
