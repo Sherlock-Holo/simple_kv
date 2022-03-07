@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bincode::{DefaultOptions, Options};
-use flume::{Receiver, Sender, TryRecvError};
+use flume::{Receiver, Sender};
 use prost::Message as _;
 use protobuf::error::WireError;
 use protobuf::ProtobufError;
@@ -189,48 +189,37 @@ where
         let mut instant = Instant::now();
 
         loop {
-            if self.is_leader() {
-                loop {
-                    match self.get_request_queue.try_recv() {
-                        Ok(reply) => {
-                            self.handle_get(reply);
-                        }
+            if self.get_request_queue.is_disconnected() {
+                error!("get request queue is disconnected");
 
-                        Err(TryRecvError::Empty) => break,
-
-                        Err(err) => {
-                            error!(%err, "acquire get request failed");
-
-                            return Err(err.into());
-                        }
-                    }
-                }
+                return Err(anyhow::anyhow!("get request queue is disconnected"));
             }
 
-            loop {
-                match self.mailbox.try_recv() {
-                    Ok(msg) => {
-                        let from = msg.from;
-
-                        info!(from, "get other node message done");
-
-                        self.raw_node.step(msg).tap_err(|err| {
-                            error!(%err, from, "step other node message failed");
-                        })?;
-                    }
-
-                    Err(TryRecvError::Empty) => {
-                        info!("mailbox is empty");
-
-                        break;
-                    }
-
-                    Err(err) => {
-                        error!(%err, "receive other nodes message failed");
-
-                        return Err(err.into());
-                    }
+            if self.is_leader() {
+                for reply in self.get_request_queue.clone().try_iter() {
+                    self.handle_get(reply);
                 }
+            } else {
+                self.get_request_queue
+                    .try_iter()
+                    .into_iter()
+                    .for_each(|reply| reply.reply(Err(anyhow::anyhow!("node is not raft leader"))));
+            }
+
+            if self.mailbox.is_disconnected() {
+                error!("mailbox is disconnected");
+
+                return Err(anyhow::anyhow!("mailbox is disconnected"));
+            }
+
+            for msg in self.mailbox.clone().try_iter() {
+                let from = msg.from;
+
+                info!(from, "get other node message done");
+
+                self.raw_node.step(msg).tap_err(|err| {
+                    error!(%err, from, "step other node message failed");
+                })?;
             }
 
             let elapsed = instant.elapsed();
@@ -344,6 +333,10 @@ where
             }
 
             info!("apply all light ready commit entries done");
+
+            self.raw_node.advance_apply();
+
+            info!("raw node advance apply done");
         }
     }
 
