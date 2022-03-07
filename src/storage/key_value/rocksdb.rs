@@ -2,14 +2,31 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use bytes::Bytes;
-use raft::{Error, StorageError};
+use raft::StorageError;
 use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use tap::TapFallible;
+use thiserror::Error;
 use tracing::{error, info};
 
 use crate::storage::key_value::{
     KeyValueDatabaseBackend, KeyValueOperation, KeyValuePair, Operation,
 };
+
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct Error(rocksdb::Error);
+
+impl From<Error> for raft::Error {
+    fn from(err: Error) -> Self {
+        raft::Error::Store(StorageError::Other(err.into()))
+    }
+}
+
+impl From<rocksdb::Error> for Error {
+    fn from(err: rocksdb::Error) -> Self {
+        Self(err)
+    }
+}
 
 pub struct RocksdbBackend {
     db: DB,
@@ -67,21 +84,18 @@ impl KeyValueDatabaseBackend for RocksdbBackend {
 
         info!("all operation are handled in write batch");
 
-        self.db.write(write_batch).map_err(|err| {
-            error!(%err, "apply key value operation failed");
-
-            Error::Store(StorageError::Other(err.into()))
-        })?;
+        self.db
+            .write(write_batch)
+            .tap_err(|err| error!(%err, "apply key value operation failed"))?;
 
         Ok(())
     }
 
     fn get<S: AsRef<[u8]>>(&mut self, key: S) -> Result<Option<Bytes>, Self::Error> {
-        let result = self.db.get(key).map_err(|err| {
-            error!(%err, "get value by key failed");
-
-            Error::Store(StorageError::Other(err.into()))
-        })?;
+        let result = self
+            .db
+            .get(key)
+            .tap_err(|err| error!(%err, "get value by key failed"))?;
 
         Ok(result.map(Into::into))
     }
@@ -107,11 +121,9 @@ impl KeyValueDatabaseBackend for RocksdbBackend {
 
         info!("insert all key-value to write batch done");
 
-        self.db.write(write_batch).map_err(|err| {
-            error!(%err, "apply key value pairs failed");
-
-            Error::Store(StorageError::Other(err.into()))
-        })?;
+        self.db
+            .write(write_batch)
+            .tap_err(|err| error!(%err, "apply key value pairs failed"))?;
 
         Ok(())
     }

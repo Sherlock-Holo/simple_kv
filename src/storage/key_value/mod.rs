@@ -9,7 +9,7 @@ use serde::de::{Unexpected, Visitor};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-mod rocksdb;
+pub mod rocksdb;
 
 #[derive(Debug, Error)]
 #[error("invalid operation {0}")]
