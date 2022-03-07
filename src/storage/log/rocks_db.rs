@@ -10,7 +10,7 @@ use rocksdb::{ColumnFamily, WriteBatch, DB};
 use tap::TapFallible;
 use tracing::{error, info};
 
-use crate::storage::key_value::KeyValueDatabaseBackend;
+use crate::storage::key_value::{KeyValueDatabaseBackend, KeyValuePair};
 use crate::storage::log::{ConfigState, Entry, HardState, LogBackend, Snapshot, SnapshotMetadata};
 
 type DataEncoding =
@@ -42,7 +42,7 @@ pub struct RocksdbBackend {
 }
 
 impl RocksdbBackend {
-    fn from_exist(db_path: &Path, config_state: ConfigState) -> anyhow::Result<Self> {
+    pub fn from_exist(db_path: &Path, config_state: ConfigState) -> anyhow::Result<Self> {
         let db = DB::open_cf(
             &rocksdb::Options::default(),
             db_path,
@@ -69,6 +69,65 @@ impl RocksdbBackend {
         info!(?config_state, "apply current config state done");
 
         Ok(backend)
+    }
+
+    pub fn create(path: &Path, config_state: ConfigState) -> anyhow::Result<Self> {
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+
+        let data_encoding = DefaultOptions::new()
+            .with_big_endian()
+            .with_varint_encoding();
+
+        let db = DB::open_cf(&options, path, [ENTRIES_COLUMN_FAMILY]).tap_err(|err| {
+            error!(%err, ?path, "create rocksdb failed");
+        })?;
+
+        let hard_state = HardState::default();
+
+        let hard_state = data_encoding.serialize(&hard_state).tap_err(|err| {
+            error!(%err, ?hard_state, "serialize hard state failed");
+        })?;
+
+        db.put(HARD_STATE_PATH, hard_state)
+            .tap_err(|err| error!(%err, "insert hard state failed"))?;
+
+        let config_state = data_encoding
+            .serialize(&config_state)
+            .tap_err(|err| error!(%err, ?config_state, "serialize config state failed"))?;
+
+        db.put(CONFIG_STATE_PATH, config_state)
+            .tap_err(|err| error!(%err, "insert config state failed"))?;
+
+        let snapshot_metadata = SnapshotMetadata::default();
+
+        let snapshot_metadata = data_encoding.serialize(&snapshot_metadata).tap_err(
+            |err| error!(%err, ?snapshot_metadata, "serialize snapshot metadata failed"),
+        )?;
+
+        db.put(SNAPSHOT_METADATA_PATH, snapshot_metadata)
+            .tap_err(|err| error!(%err, "insert snapshot metadata failed"))?;
+
+        let snapshot_data = Vec::<KeyValuePair>::new();
+
+        let snapshot_data = data_encoding
+            .serialize(&snapshot_data)
+            .tap_err(|err| error!(%err, "serialize emtpy snapshot data failed"))?;
+
+        db.put(SNAPSHOT_DATA_PATH, snapshot_data)
+            .tap_err(|err| error!(%err, "insert empty snapshot data failed"))?;
+
+        let last_index = data_encoding
+            .serialize(&0u64)
+            .tap_err(|err| error!(%err, "serialize 0 last index failed"))?;
+
+        db.put(LAST_INDEX_PATH, last_index)
+            .tap_err(|err| error!(%err, "insert 0 last index failed"))?;
+
+        info!("init rocksdb done");
+
+        Ok(RocksdbBackend { db, data_encoding })
     }
 
     fn apply_hard_state_with_batch(
@@ -916,9 +975,7 @@ mod tests {
     fn create_backend_with_config_state(config_state: ConfigState) -> RocksdbBackend {
         let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
 
-        create_test_db(tmp_dir.path(), encoding());
-
-        RocksdbBackend::from_exist(tmp_dir.path(), config_state).unwrap()
+        RocksdbBackend::create(tmp_dir.path(), config_state).unwrap()
     }
 
     #[test]
