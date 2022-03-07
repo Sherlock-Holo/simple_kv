@@ -910,10 +910,9 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Registry;
 
+    use super::*;
     use crate::storage::key_value::{KeyValueOperation, KeyValuePair, Operation};
     use crate::storage::log::EntryType;
-
-    use super::*;
 
     fn init_log() {
         static INIT_LOG: OnceCell<()> = OnceCell::new();
@@ -927,69 +926,44 @@ mod tests {
         });
     }
 
-    fn create_test_db<O: Options + Copy>(path: &Path, encoding: O) {
-        let mut options = rocksdb::Options::default();
-        options.create_if_missing(true);
-        options.create_missing_column_families(true);
-
-        let db = DB::open_cf(&options, path, [ENTRIES_COLUMN_FAMILY]).unwrap();
-
-        let hard_state = HardState::default();
-        let config_state = ConfigState::default();
-
-        let hard_state = encoding.serialize(&hard_state).unwrap();
-
-        db.put(HARD_STATE_PATH, hard_state).unwrap();
-
-        let config_state = encoding.serialize(&config_state).unwrap();
-
-        db.put(CONFIG_STATE_PATH, config_state).unwrap();
-
-        let snapshot_metadata = SnapshotMetadata::default();
-
-        let snapshot_metadata = encoding.serialize(&snapshot_metadata).unwrap();
-
-        db.put(SNAPSHOT_METADATA_PATH, snapshot_metadata).unwrap();
-
-        let snapshot_data = Vec::<KeyValuePair>::new();
-
-        let snapshot_data = encoding.serialize(&snapshot_data).unwrap();
-
-        db.put(SNAPSHOT_DATA_PATH, snapshot_data).unwrap();
-
-        let last_index = encoding.serialize(&0u64).unwrap();
-
-        db.put(LAST_INDEX_PATH, last_index).unwrap();
-    }
-
     fn encoding() -> impl Options + Copy {
         DefaultOptions::new()
             .with_big_endian()
             .with_varint_encoding()
     }
 
-    fn create_backend() -> RocksdbBackend {
-        create_backend_with_config_state(Default::default())
+    fn create_backend(path: &Path) -> RocksdbBackend {
+        create_backend_with_config_state(path, Default::default())
     }
 
-    fn create_backend_with_config_state(config_state: ConfigState) -> RocksdbBackend {
-        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+    fn create_backend_with_config_state(path: &Path, config_state: ConfigState) -> RocksdbBackend {
+        RocksdbBackend::create(path, config_state).unwrap()
+    }
 
-        RocksdbBackend::create(tmp_dir.path(), config_state).unwrap()
+    #[test]
+    fn test_create() {
+        init_log();
+
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        create_backend(tmp_dir.path());
     }
 
     #[test]
     fn test_from_exist() {
         init_log();
 
-        create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        create_backend(tmp_dir.path());
+
+        RocksdbBackend::from_exist(tmp_dir.path(), ConfigState::default()).unwrap();
     }
 
     #[test]
     fn test_first_index() {
         init_log();
 
-        let backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let backend = create_backend(tmp_dir.path());
 
         assert_eq!(backend.first_index().unwrap(), 1);
     }
@@ -998,7 +972,8 @@ mod tests {
     fn test_last_index() {
         init_log();
 
-        let backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let backend = create_backend(tmp_dir.path());
 
         assert_eq!(backend.last_index().unwrap(), 0);
     }
@@ -1007,7 +982,8 @@ mod tests {
     fn test_hard_state() {
         init_log();
 
-        let backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let backend = create_backend(tmp_dir.path());
 
         let hard_state = backend.initial_hard_state().unwrap();
 
@@ -1026,7 +1002,8 @@ mod tests {
             auto_leave: false,
         };
 
-        let backend = create_backend_with_config_state(config_state.clone());
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let backend = create_backend_with_config_state(tmp_dir.path(), config_state.clone());
 
         assert_eq!(backend.initial_config_state().unwrap(), config_state)
     }
@@ -1035,7 +1012,8 @@ mod tests {
     fn test_append_entries() {
         init_log();
 
-        let mut backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend(tmp_dir.path());
 
         backend
             .append_entries(vec![
@@ -1061,7 +1039,8 @@ mod tests {
     fn test_term() {
         init_log();
 
-        let mut backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend(tmp_dir.path());
 
         backend
             .append_entries(vec![
@@ -1084,14 +1063,15 @@ mod tests {
 
         assert_eq!(backend.term(1).unwrap(), 1);
         assert_eq!(backend.term(2).unwrap(), 1);
-        dbg!(backend.term(3).unwrap_err());
+        assert!(backend.term(3).is_err());
     }
 
     #[test]
     fn test_first_index_after_append_entries() {
         init_log();
 
-        let mut backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend(tmp_dir.path());
 
         backend
             .append_entries(vec![
@@ -1119,7 +1099,8 @@ mod tests {
     fn test_last_index_after_append_entries() {
         init_log();
 
-        let mut backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend(tmp_dir.path());
 
         backend
             .append_entries(vec![
@@ -1147,7 +1128,8 @@ mod tests {
     fn test_apply_hard_state() {
         init_log();
 
-        let mut backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend(tmp_dir.path());
 
         backend
             .append_entries(vec![
@@ -1183,7 +1165,8 @@ mod tests {
     fn test_apply_config_state() {
         init_log();
 
-        let mut backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend(tmp_dir.path());
 
         let mut config_state = backend.initial_config_state().unwrap();
         config_state.voters.push(1);
@@ -1197,7 +1180,8 @@ mod tests {
     fn test_apply_commit_index() {
         init_log();
 
-        let mut backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend(tmp_dir.path());
 
         backend
             .append_entries(vec![
@@ -1231,7 +1215,8 @@ mod tests {
     fn test_entries() {
         init_log();
 
-        let mut backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend(tmp_dir.path());
 
         backend
             .append_entries(vec![
@@ -1328,8 +1313,8 @@ mod tests {
             Ok(())
         }
 
-        fn get(&mut self, key: &Bytes) -> Result<Option<Bytes>, Self::Error> {
-            Ok(self.map.get(key).cloned())
+        fn get<S: AsRef<[u8]>>(&mut self, key: S) -> Result<Option<Bytes>, Self::Error> {
+            Ok(self.map.get(key.as_ref()).cloned())
         }
 
         fn apply_key_value_pairs(
@@ -1358,7 +1343,8 @@ mod tests {
     fn test_snapshot() {
         init_log();
 
-        let mut backend = create_backend_with_config_state(ConfigState::default());
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend_with_config_state(tmp_dir.path(), ConfigState::default());
 
         let encoding = encoding();
 
@@ -1441,7 +1427,8 @@ mod tests {
     fn test_apply_snapshot() {
         init_log();
 
-        let mut backend = create_backend();
+        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
+        let mut backend = create_backend(tmp_dir.path());
 
         let encoding = encoding();
 

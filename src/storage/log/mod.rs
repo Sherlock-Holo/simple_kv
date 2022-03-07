@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use super::key_value::KeyValueDatabaseBackend;
 
-mod rocks_db;
+mod rocksdb;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EntryType {
