@@ -5,15 +5,18 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+build = "build.rs"
+
 [dependencies]
+tracing = "0.1"
+tracing-subscriber = "0.3"
 raft = { version = "0.6", default-features = false, features = ["prost-codec", "default-logger"] }
 prost07 = { package = "prost", version = "0.7" }
 protobuf = "2"
 tonic = "0.6"
 prost = "0.9"
 prost-types = "0.9"
-tracing = "0.1"
-tracing-subscriber = "0.3"
+async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "macros"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
@@ -23,6 +26,7 @@ tap = "1"
 bincode = "1"
 bytes = { version = "1", features = ["serde"] }
 anyhow = "1"
+futures-util = { version = "0.3", features = ["sink"] }
 
 [build-dependencies]
 tonic-build = "0.6"

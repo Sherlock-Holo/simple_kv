@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package simple_kv;
+
+import "google/protobuf/empty.proto";
+
+message RaftMessageRequest {
+  bytes message = 1;
+}
+
+message RaftMessageResponse {}
+
+service Raft {
+  rpc send_message(RaftMessageRequest) returns (RaftMessageResponse) {}
+}
+
+message KvError {
+  string detail = 1;
+}
+
+message KvInsertRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message KvInsertResponse {
+  oneof result {
+    KvError error = 1;
+    google.protobuf.Empty success = 2;
+  }
+}
+
+message KvGetRequest {
+  bytes key = 1;
+}
+
+message KvGetResponseValue {
+  optional bytes value = 1;
+}
+
+message KvGetResponse {
+  oneof result {
+    KvError error = 1;
+    KvGetResponseValue value = 2;
+  }
+}
+
+message KvDeleteRequest {
+  bytes key = 1;
+}
+
+message KvDeleteResponse {
+  oneof result {
+    KvError error = 1;
+    google.protobuf.Empty success = 2;
+  }
+}
+
+service Kv {
+  rpc insert(KvInsertRequest) returns (KvInsertResponse) {}
+
+  rpc get(KvGetRequest) returns (KvGetResponse) {}
+
+  rpc Delete(KvDeleteRequest) returns (KvDeleteResponse) {}
+}
