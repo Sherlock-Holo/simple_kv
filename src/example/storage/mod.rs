@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use prost::Message;
+use prost07::Message;
 use raft::{
     eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata},
     Error, RaftState, Storage, StorageError,

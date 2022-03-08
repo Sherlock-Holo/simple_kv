@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use std::{error, io};
 
-use prost::Message as _;
+use prost07::Message as _;
 use protobuf::error::WireError;
 use protobuf::ProtobufError;
 use raft::prelude::*;
@@ -85,6 +85,8 @@ impl Node {
                     _ => break,
                 }
             }
+
+            info!(state_role = ?self.raw_node.raft.state, "raw node state role");
 
             if instant.elapsed() >= TICK_INTERVAL {
                 self.raw_node.tick();
