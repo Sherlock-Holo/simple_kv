@@ -7,8 +7,6 @@ use serde::de::{Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use super::key_value::KeyValueBackend;
-
 pub mod rocksdb;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

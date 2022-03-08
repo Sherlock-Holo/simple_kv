@@ -7,7 +7,7 @@ use raft::StorageError;
 use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use tap::TapFallible;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, instrument};
 
 use crate::storage::key_value::{KeyValueBackend, KeyValueOperation, KeyValuePair, Operation};
 
@@ -60,6 +60,7 @@ impl RocksdbBackend {
 impl KeyValueBackend for RocksdbBackend {
     type Error = Error;
 
+    #[instrument(skip(self, operations), err)]
     fn apply_key_value_operation(
         &mut self,
         operations: Vec<KeyValueOperation>,
@@ -91,6 +92,7 @@ impl KeyValueBackend for RocksdbBackend {
         Ok(())
     }
 
+    #[instrument(skip(self, key), err)]
     fn get<S: AsRef<[u8]>>(&mut self, key: S) -> Result<Option<Bytes>, Self::Error> {
         let result = self
             .db
@@ -100,6 +102,7 @@ impl KeyValueBackend for RocksdbBackend {
         Ok(result.map(Into::into))
     }
 
+    #[instrument(skip(self, pairs), err)]
     fn apply_key_value_pairs(&mut self, pairs: HashSet<KeyValuePair>) -> Result<(), Self::Error> {
         let mut write_batch = WriteBatch::default();
 
@@ -128,6 +131,7 @@ impl KeyValueBackend for RocksdbBackend {
         Ok(())
     }
 
+    #[instrument(skip(self), err)]
     fn all(&self) -> Result<Vec<KeyValuePair>, Self::Error> {
         let pairs = self
             .db

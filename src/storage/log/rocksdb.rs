@@ -8,10 +8,13 @@ use bytes::{BufMut, BytesMut};
 use raft::{eraftpb, Error, RaftState, Storage, StorageError};
 use rocksdb::{ColumnFamily, WriteBatch, DB};
 use tap::TapFallible;
+use tracing::instrument;
 use tracing::{error, info};
 
 use crate::storage::key_value::{KeyValueBackend, KeyValuePair};
-use crate::storage::log::{ConfigState, Entry, HardState, LogBackend, Snapshot, SnapshotMetadata};
+use crate::storage::log::{
+    ConfigState, Entry, EntryType, HardState, LogBackend, Snapshot, SnapshotMetadata,
+};
 
 type DataEncoding =
     WithOtherIntEncoding<WithOtherEndian<DefaultOptions, BigEndian>, VarintEncoding>;
@@ -140,13 +143,32 @@ where
 
         info!("init rocksdb done");
 
-        Ok(RocksdbBackend {
+        let mut backend = RocksdbBackend {
             db,
             kv_backend,
             data_encoding,
-        })
+        };
+
+        backend.create_init_entry()?;
+
+        info!("create init entry done");
+
+        Ok(backend)
     }
 
+    fn create_init_entry(&mut self) -> anyhow::Result<()> {
+        self.append_entries(vec![Entry {
+            entry_type: EntryType::EntryNormal,
+            term: 0,
+            index: 1,
+            data: Default::default(),
+            context: Default::default(),
+        }])?;
+
+        Ok(())
+    }
+
+    #[instrument(skip(self, batch, encode_buf), err)]
     fn apply_hard_state_with_batch(
         &mut self,
         hard_state: &HardState,
@@ -187,6 +209,7 @@ where
         }
     }
 
+    #[instrument(skip(self, batch, encode_buf), err)]
     fn apply_config_state_with_batch(
         &mut self,
         config_state: &ConfigState,
@@ -227,6 +250,7 @@ where
         }
     }
 
+    #[instrument(skip(self), err)]
     fn get_snapshot_metadata(&self) -> Result<SnapshotMetadata, Error> {
         let metadata = self.db.get_pinned(SNAPSHOT_METADATA_PATH).map_err(|err| {
             error!(%err, "get snapshot metadata failed");
@@ -251,6 +275,7 @@ where
         }
     }
 
+    #[instrument(skip(self), err)]
     fn get_column_family_handle(&self, column_family: &str) -> Result<&ColumnFamily, Error> {
         let column_family_handle = self.db.cf_handle(column_family).ok_or_else(|| {
             error!(column_family, "column family not found");
@@ -261,8 +286,9 @@ where
         Ok(column_family_handle)
     }
 
+    #[instrument(skip(self), err)]
     fn create_snapshot(&self, request_index: u64) -> Result<Snapshot, Error> {
-        let hard_state = self.initial_hard_state()?;
+        let hard_state = self.hard_state()?;
 
         info!(?hard_state, "get hard state done");
 
@@ -302,7 +328,7 @@ where
             info!(delete_index, %delete_entry_path, "delete entry to write batch done");
         }
 
-        let config_state = self.initial_config_state()?;
+        let config_state = self.config_state()?;
 
         info!(?config_state, "get current config state done");
 
@@ -371,7 +397,8 @@ where
         })
     }
 
-    fn initial_hard_state(&self) -> Result<HardState, Error> {
+    #[instrument(skip(self), err)]
+    fn hard_state(&self) -> Result<HardState, Error> {
         let hard_state = self.db.get_pinned(HARD_STATE_PATH).map_err(|err| {
             error!(%err, "get hard state failed");
 
@@ -380,10 +407,10 @@ where
 
         let hard_state = match hard_state {
             None => {
-                error!("an initial rocks db has no hard state");
+                error!("rocksdb has no hard state");
 
                 return Err(Error::ConfigInvalid(
-                    "an initial rocks db has no hard state".to_string(),
+                    "rocksdb has no hard state".to_string(),
                 ));
             }
 
@@ -404,7 +431,8 @@ where
         Ok(hard_state)
     }
 
-    fn initial_config_state(&self) -> Result<ConfigState, Error> {
+    #[instrument(skip(self), err)]
+    fn config_state(&self) -> Result<ConfigState, Error> {
         let config_state = self.db.get_pinned(CONFIG_STATE_PATH).map_err(|err| {
             error!(%err, "get config state failed");
 
@@ -413,10 +441,10 @@ where
 
         let config_state = match config_state {
             None => {
-                error!("an initial rocks db has no config state");
+                error!("rocksdb has no config state");
 
                 return Err(Error::ConfigInvalid(
-                    "an initial rocks db has no config state".to_string(),
+                    "rocksdb has no config state".to_string(),
                 ));
             }
 
@@ -448,6 +476,7 @@ where
 {
     type Error = Error;
 
+    #[instrument(skip(self, entries), err)]
     fn append_entries(&mut self, entries: Vec<Entry>) -> Result<(), Self::Error> {
         if entries.is_empty() {
             info!("entries is empty");
@@ -564,14 +593,17 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self), err)]
     fn apply_config_state(&mut self, config_state: ConfigState) -> Result<(), Self::Error> {
         self.apply_config_state_with_batch(&config_state, None, &mut BytesMut::new())
     }
 
+    #[instrument(skip(self), err)]
     fn apply_hard_state(&mut self, hard_state: HardState) -> Result<(), Self::Error> {
         self.apply_hard_state_with_batch(&hard_state, None, &mut BytesMut::new())
     }
 
+    #[instrument(skip(self), err)]
     fn apply_commit_index(&mut self, commit_index: u64) -> Result<(), Self::Error> {
         let last_index = self.last_index()?;
 
@@ -583,7 +615,7 @@ where
             return Err(Error::Store(StorageError::Unavailable));
         }
 
-        let mut hard_state = self.initial_hard_state()?;
+        let mut hard_state = self.hard_state()?;
 
         info!(?hard_state, "get hard state done");
 
@@ -596,6 +628,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self, snapshot), err)]
     fn apply_snapshot(&mut self, snapshot: Snapshot) -> Result<(), Self::Error> {
         let snapshot_index = snapshot.metadata.index;
         let snapshot_term = snapshot.metadata.term;
@@ -614,7 +647,7 @@ where
             return Err(Error::Store(StorageError::SnapshotOutOfDate));
         }
 
-        let mut hard_state = self.initial_hard_state()?;
+        let mut hard_state = self.hard_state()?;
 
         hard_state.commit = snapshot_index;
         hard_state.term = hard_state.term.max(snapshot_term);
@@ -708,12 +741,13 @@ where
     KV: KeyValueBackend,
     KV::Error: Into<Error>,
 {
+    #[instrument(skip(self), err)]
     fn initial_state(&self) -> raft::Result<RaftState> {
-        let hard_state = self.initial_hard_state()?;
+        let hard_state = self.hard_state()?;
 
         info!(?hard_state, "get initial hard state done");
 
-        let config_state = self.initial_config_state()?;
+        let config_state = self.config_state()?;
 
         info!(?config_state, "get initial config state done");
 
@@ -723,6 +757,7 @@ where
         })
     }
 
+    #[instrument(skip(self, max_size), err)]
     fn entries(
         &self,
         low: u64,
@@ -809,6 +844,7 @@ where
         Ok(entries)
     }
 
+    #[instrument(skip(self), err)]
     fn term(&self, idx: u64) -> raft::Result<u64> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
@@ -863,6 +899,7 @@ where
         Ok(entry.term)
     }
 
+    #[instrument(skip(self), err)]
     fn first_index(&self) -> raft::Result<u64> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
@@ -872,6 +909,7 @@ where
         Ok(snapshot_metadata.index + 1)
     }
 
+    #[instrument(skip(self), err)]
     fn last_index(&self) -> raft::Result<u64> {
         let last_index = self.db.get_pinned(LAST_INDEX_PATH).map_err(|err| {
             error!(%err, "get last index path failed");
@@ -898,6 +936,7 @@ where
         }
     }
 
+    #[instrument(skip(self), err)]
     fn snapshot(&self, request_index: u64) -> raft::Result<eraftpb::Snapshot> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
@@ -1046,7 +1085,7 @@ mod tests {
         let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
         let backend = create_backend(tmp_dir.path());
 
-        let hard_state = backend.initial_hard_state().unwrap();
+        let hard_state = backend.hard_state().unwrap();
 
         assert_eq!(hard_state, HardState::default())
     }
@@ -1066,7 +1105,7 @@ mod tests {
         let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
         let backend = create_backend_with_config_state(tmp_dir.path(), config_state.clone());
 
-        assert_eq!(backend.initial_config_state().unwrap(), config_state)
+        assert_eq!(backend.config_state().unwrap(), config_state)
     }
 
     #[test]
@@ -1219,7 +1258,7 @@ mod tests {
 
         backend.apply_hard_state(hard_state.clone()).unwrap();
 
-        assert_eq!(backend.initial_hard_state().unwrap(), hard_state);
+        assert_eq!(backend.hard_state().unwrap(), hard_state);
     }
 
     #[test]
@@ -1229,12 +1268,12 @@ mod tests {
         let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
         let mut backend = create_backend(tmp_dir.path());
 
-        let mut config_state = backend.initial_config_state().unwrap();
+        let mut config_state = backend.config_state().unwrap();
         config_state.voters.push(1);
 
         backend.apply_config_state(config_state.clone()).unwrap();
 
-        assert_eq!(backend.initial_config_state().unwrap(), config_state);
+        assert_eq!(backend.config_state().unwrap(), config_state);
     }
 
     #[test]
@@ -1263,13 +1302,13 @@ mod tests {
             ])
             .unwrap();
 
-        let mut hard_state = backend.initial_hard_state().unwrap();
+        let mut hard_state = backend.hard_state().unwrap();
 
         backend.apply_commit_index(2).unwrap();
 
         hard_state.commit = 2;
 
-        assert_eq!(backend.initial_hard_state().unwrap(), hard_state);
+        assert_eq!(backend.hard_state().unwrap(), hard_state);
     }
 
     #[test]
@@ -1462,7 +1501,7 @@ mod tests {
             ])
             .unwrap();
 
-        let mut hard_state = backend.initial_hard_state().unwrap();
+        let mut hard_state = backend.hard_state().unwrap();
         hard_state.commit = 2;
         hard_state.term = 1;
 
@@ -1596,7 +1635,7 @@ mod tests {
         assert_eq!(backend.term(3).unwrap(), 1);
 
         assert_eq!(
-            backend.initial_hard_state().unwrap(),
+            backend.hard_state().unwrap(),
             HardState {
                 term: 2,
                 vote: 0,
@@ -1605,7 +1644,7 @@ mod tests {
         );
 
         assert_eq!(
-            backend.initial_config_state().unwrap(),
+            backend.config_state().unwrap(),
             ConfigState {
                 voters: vec![1],
                 ..Default::default()
