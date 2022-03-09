@@ -143,29 +143,11 @@ where
 
         info!("init rocksdb done");
 
-        let mut backend = RocksdbBackend {
+        Ok(RocksdbBackend {
             db,
             kv_backend,
             data_encoding,
-        };
-
-        backend.create_init_entry()?;
-
-        info!("create init entry done");
-
-        Ok(backend)
-    }
-
-    fn create_init_entry(&mut self) -> anyhow::Result<()> {
-        self.append_entries(vec![Entry {
-            entry_type: EntryType::EntryNormal,
-            term: 0,
-            index: 1,
-            data: Default::default(),
-            context: Default::default(),
-        }])?;
-
-        Ok(())
+        })
     }
 
     #[instrument(skip(self, batch, encode_buf), err)]
@@ -1470,17 +1452,17 @@ mod tests {
 
         let encoding = encoding();
 
-        let kv_op1 = KeyValueOperation {
-            operation: Operation::InsertOrUpdate,
-            key: Bytes::from(b"test1".as_slice()),
-            value: Bytes::from(b"test1".as_slice()),
-        };
+        let kv_op1 = KeyValueOperation::new(
+            Operation::InsertOrUpdate,
+            b"test1".as_slice(),
+            b"test1".as_slice(),
+        );
 
-        let kv_op2 = KeyValueOperation {
-            operation: Operation::InsertOrUpdate,
-            key: Bytes::from(b"test2".as_slice()),
-            value: Bytes::from(b"test2".as_slice()),
-        };
+        let kv_op2 = KeyValueOperation::new(
+            Operation::InsertOrUpdate,
+            b"test2".as_slice(),
+            b"test2".as_slice(),
+        );
 
         backend
             .append_entries(vec![
@@ -1531,14 +1513,8 @@ mod tests {
         assert_eq!(
             key_value_pairs,
             HashSet::from([
-                KeyValuePair {
-                    key: b"test1".as_slice().into(),
-                    value: b"test1".as_slice().into(),
-                },
-                KeyValuePair {
-                    key: b"test2".as_slice().into(),
-                    value: b"test2".as_slice().into(),
-                }
+                KeyValuePair::new(b"test1".as_slice(), b"test1".as_slice()),
+                KeyValuePair::new(b"test2".as_slice(), b"test2".as_slice()),
             ])
         )
     }
@@ -1552,17 +1528,17 @@ mod tests {
 
         let encoding = encoding();
 
-        let kv_op1 = KeyValueOperation {
-            operation: Operation::InsertOrUpdate,
-            key: Bytes::from(b"test1".as_slice()),
-            value: Bytes::from(b"test1".as_slice()),
-        };
+        let kv_op1 = KeyValueOperation::new(
+            Operation::InsertOrUpdate,
+            b"test1".as_slice(),
+            b"test1".as_slice(),
+        );
 
-        let kv_op2 = KeyValueOperation {
-            operation: Operation::InsertOrUpdate,
-            key: Bytes::from(b"test2".as_slice()),
-            value: Bytes::from(b"test2".as_slice()),
-        };
+        let kv_op2 = KeyValueOperation::new(
+            Operation::InsertOrUpdate,
+            b"test2".as_slice(),
+            b"test2".as_slice(),
+        );
 
         backend
             .append_entries(vec![
@@ -1591,8 +1567,8 @@ mod tests {
             .unwrap();
 
         let pairs = vec![
-            KeyValuePair::new(b"test11".as_slice().into(), b"test11".as_slice().into()),
-            KeyValuePair::new(b"test22".as_slice().into(), b"test22".as_slice().into()),
+            KeyValuePair::new(b"test11".as_slice(), b"test11".as_slice()),
+            KeyValuePair::new(b"test22".as_slice(), b"test22".as_slice()),
         ];
 
         let snapshot_data = encoding.serialize(&pairs).unwrap();

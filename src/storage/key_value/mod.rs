@@ -3,7 +3,6 @@ use std::error::Error;
 use std::fmt::Formatter;
 use std::hash::{Hash, Hasher};
 
-use bincode::Options;
 use bytes::Bytes;
 use serde::de::{Unexpected, Visitor};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -91,11 +90,11 @@ pub struct KeyValueOperation {
 }
 
 impl KeyValueOperation {
-    pub fn new(operation: Operation, key: Bytes, value: Bytes) -> Self {
+    pub fn new(operation: Operation, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
         Self {
             operation,
-            key,
-            value,
+            key: key.into(),
+            value: value.into(),
         }
     }
 }
@@ -107,17 +106,11 @@ pub struct KeyValuePair {
 }
 
 impl KeyValuePair {
-    pub fn new(key: Bytes, value: Bytes) -> Self {
-        Self { key, value }
-    }
-
-    pub fn from_snapshot_data<E: Options>(
-        encoding: E,
-        data: Bytes,
-    ) -> Result<HashSet<KeyValuePair>, bincode::Error> {
-        let key_value_pairs: Vec<Self> = encoding.deserialize(&data)?;
-
-        Ok(key_value_pairs.into_iter().collect())
+    pub fn new(key: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
     }
 }
 

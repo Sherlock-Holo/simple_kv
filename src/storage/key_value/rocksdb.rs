@@ -136,10 +136,7 @@ impl KeyValueBackend for RocksdbBackend {
         let pairs = self
             .db
             .iterator(IteratorMode::Start)
-            .map(|(key, value)| KeyValuePair {
-                key: key.into(),
-                value: value.into(),
-            })
+            .map(|(key, value)| KeyValuePair::new(key, value))
             .collect();
 
         Ok(pairs)
@@ -184,16 +181,16 @@ mod tests {
 
         backend
             .apply_key_value_operation(vec![
-                KeyValueOperation {
-                    operation: Operation::InsertOrUpdate,
-                    key: Bytes::from(b"test1".as_slice()),
-                    value: Bytes::from(b"test1".as_slice()),
-                },
-                KeyValueOperation {
-                    operation: Operation::InsertOrUpdate,
-                    key: Bytes::from(b"test2".as_slice()),
-                    value: Bytes::from(b"test2".as_slice()),
-                },
+                KeyValueOperation::new(
+                    Operation::InsertOrUpdate,
+                    b"test1".as_slice(),
+                    b"test1".as_slice(),
+                ),
+                KeyValueOperation::new(
+                    Operation::InsertOrUpdate,
+                    b"test2".as_slice(),
+                    b"test2".as_slice(),
+                ),
             ])
             .unwrap();
 
@@ -201,11 +198,11 @@ mod tests {
         assert_eq!(backend.db.get(b"test2").unwrap().unwrap(), b"test2");
 
         backend
-            .apply_key_value_operation(vec![KeyValueOperation {
-                operation: Operation::Delete,
-                key: Bytes::from(b"test2".as_slice()),
-                value: Default::default(),
-            }])
+            .apply_key_value_operation(vec![KeyValueOperation::new(
+                Operation::Delete,
+                b"test2".as_slice(),
+                [].as_slice(),
+            )])
             .unwrap();
 
         assert_eq!(backend.db.get(b"test1").unwrap().unwrap(), b"test1");
@@ -219,11 +216,11 @@ mod tests {
         let mut backend = RocksdbBackend::create(tmp_dir.path()).unwrap();
 
         backend
-            .apply_key_value_operation(vec![KeyValueOperation {
-                operation: Operation::InsertOrUpdate,
-                key: Bytes::from(b"test1".as_slice()),
-                value: Bytes::from(b"test1".as_slice()),
-            }])
+            .apply_key_value_operation(vec![KeyValueOperation::new(
+                Operation::InsertOrUpdate,
+                b"test1".as_slice(),
+                b"test1".as_slice(),
+            )])
             .unwrap();
 
         assert_eq!(
@@ -232,11 +229,11 @@ mod tests {
         );
 
         backend
-            .apply_key_value_operation(vec![KeyValueOperation {
-                operation: Operation::Delete,
-                key: Bytes::from(b"test1".as_slice()),
-                value: Default::default(),
-            }])
+            .apply_key_value_operation(vec![KeyValueOperation::new(
+                Operation::Delete,
+                b"test1".as_slice(),
+                [].as_slice(),
+            )])
             .unwrap();
 
         assert!(backend.get(b"test1").unwrap().is_none());
@@ -250,29 +247,23 @@ mod tests {
 
         backend
             .apply_key_value_operation(vec![
-                KeyValueOperation {
-                    operation: Operation::InsertOrUpdate,
-                    key: Bytes::from(b"test1".as_slice()),
-                    value: Bytes::from(b"test1".as_slice()),
-                },
-                KeyValueOperation {
-                    operation: Operation::InsertOrUpdate,
-                    key: Bytes::from(b"test2".as_slice()),
-                    value: Bytes::from(b"test2".as_slice()),
-                },
+                KeyValueOperation::new(
+                    Operation::InsertOrUpdate,
+                    b"test1".as_slice(),
+                    b"test1".as_slice(),
+                ),
+                KeyValueOperation::new(
+                    Operation::InsertOrUpdate,
+                    b"test2".as_slice(),
+                    b"test2".as_slice(),
+                ),
             ])
             .unwrap();
 
         backend
             .apply_key_value_pairs(HashSet::from([
-                KeyValuePair {
-                    key: Bytes::from(b"test11".as_slice()),
-                    value: Bytes::from(b"test11".as_slice()),
-                },
-                KeyValuePair {
-                    key: Bytes::from(b"test22".as_slice()),
-                    value: Bytes::from(b"test22".as_slice()),
-                },
+                KeyValuePair::new(b"test11".as_slice(), b"test11".as_slice()),
+                KeyValuePair::new(b"test22".as_slice(), b"test22".as_slice()),
             ]))
             .unwrap();
 
@@ -297,30 +288,24 @@ mod tests {
 
         backend
             .apply_key_value_operation(vec![
-                KeyValueOperation {
-                    operation: Operation::InsertOrUpdate,
-                    key: Bytes::from(b"test1".as_slice()),
-                    value: Bytes::from(b"test1".as_slice()),
-                },
-                KeyValueOperation {
-                    operation: Operation::InsertOrUpdate,
-                    key: Bytes::from(b"test2".as_slice()),
-                    value: Bytes::from(b"test2".as_slice()),
-                },
+                KeyValueOperation::new(
+                    Operation::InsertOrUpdate,
+                    b"test1".as_slice(),
+                    b"test1".as_slice(),
+                ),
+                KeyValueOperation::new(
+                    Operation::InsertOrUpdate,
+                    b"test2".as_slice(),
+                    b"test2".as_slice(),
+                ),
             ])
             .unwrap();
 
         assert_eq!(
             backend.all().unwrap(),
             vec![
-                KeyValuePair {
-                    key: Bytes::from(b"test1".as_slice()),
-                    value: Bytes::from(b"test1".as_slice()),
-                },
-                KeyValuePair {
-                    key: Bytes::from(b"test2".as_slice()),
-                    value: Bytes::from(b"test2".as_slice()),
-                },
+                KeyValuePair::new(b"test1".as_slice(), b"test1".as_slice()),
+                KeyValuePair::new(b"test2".as_slice(), b"test2".as_slice()),
             ]
         );
     }

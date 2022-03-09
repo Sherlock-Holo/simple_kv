@@ -49,12 +49,6 @@ impl<KV, ST> NodeBuilder<KV, ST> {
         self
     }
 
-    pub fn tick_interval(&mut self, tick_interval: Duration) -> &mut Self {
-        self.tick_interval = tick_interval;
-
-        self
-    }
-
     pub fn storage(&mut self, storage: ST) -> &mut Self {
         self.storage.replace(storage);
 
