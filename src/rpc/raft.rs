@@ -19,10 +19,11 @@ use super::pb::*;
 use crate::rpc::pb::raft_client::RaftClient;
 use crate::rpc::pb::raft_server::{Raft, RaftServer};
 
+#[derive(Clone, Debug)]
 pub struct PeerNodeConfig {
-    id: u64,
-    channel: Channel,
-    mailbox: Receiver<eraftpb::Message>,
+    pub id: u64,
+    pub channel: Channel,
+    pub mailbox: Receiver<eraftpb::Message>,
 }
 
 struct PeerNode {
@@ -97,15 +98,15 @@ impl Raft for LocalNode {
     }
 }
 
-pub struct Node {
+pub struct Rpc {
     grpc_listen_addr: SocketAddr,
     local_node: Option<LocalNode>,
     peer_nodes: HashMap<u64, PeerNode>,
 }
 
-impl Node {
+impl Rpc {
     pub fn new(
-        grpc_listen_addr: SocketAddr,
+        listen_addr: SocketAddr,
         raft_message_sender: Sender<eraftpb::Message>,
         peer_node_configs: Vec<PeerNodeConfig>,
     ) -> Self {
@@ -127,7 +128,7 @@ impl Node {
             .collect::<HashMap<_, _>>();
 
         Self {
-            grpc_listen_addr,
+            grpc_listen_addr: listen_addr,
             local_node: Some(local_node),
             peer_nodes,
         }
@@ -187,7 +188,9 @@ async fn run_local_node(listen_addr: SocketAddr, local_node: LocalNode) -> anyho
         .add_service(RaftServer::new(local_node))
         .serve(listen_addr)
         .await
-        .tap_err(|err| error!(%err, "local node stops unexpected"))?;
+        .tap_err(|err| error!(%err, "local raft node grpc server stopped unexpected"))?;
 
-    Err(anyhow::anyhow!("local node grpc server stopped unexpected"))
+    Err(anyhow::anyhow!(
+        "local raft node grpc server stopped unexpected"
+    ))
 }
