@@ -12,7 +12,7 @@ use raft::{eraftpb, Config, RawNode, StateRole, Storage};
 use tap::TapFallible;
 use tracing::{error, info, instrument, warn};
 
-use crate::reply::{GetRequestReply, ProposalRequestReply};
+use crate::reply::{GetRequestReply, ProposalRequestReply, RequestError};
 use crate::storage::key_value::{KeyValueBackend, KeyValueOperation};
 use crate::storage::log::{ConfigState, Entry, EntryType, LogBackend, Snapshot};
 
@@ -221,8 +221,10 @@ where
                 .try_iter()
                 .into_iter()
                 .for_each(|reply| {
-                    warn!("reject get request because node is not leader");
-                    reply.reply(Err(anyhow::anyhow!("node is not raft leader")))
+                    let leader_id = self.raw_node.raft.leader_id;
+
+                    warn!(leader_id, "reject get request because node is not leader");
+                    reply.reply(Err(RequestError::NotLeader(leader_id)))
                 });
         }
 
@@ -261,9 +263,14 @@ where
 
         if self.raw_node.raft.state != StateRole::Leader {
             for reply in proposal_request_queue.by_ref() {
-                warn!("node is not raff leader, reject proposal request");
+                let leader_id = self.raw_node.raft.leader_id;
 
-                reply.reply(Err(anyhow::anyhow!("node is not leader")));
+                warn!(
+                    leader_id,
+                    "node is not raff leader, reject proposal request"
+                );
+
+                reply.reply(Err(RequestError::NotLeader(leader_id)));
             }
         } else if let Some(reply) = proposal_request_queue.peek_mut() {
             if !reply.handling() {
@@ -522,7 +529,7 @@ where
 
     fn handle_get(&mut self, reply: GetRequestReply) {
         let result = match self.key_value_backend.get(reply.key()) {
-            Err(err) => Err(anyhow::Error::from(err)),
+            Err(err) => Err(RequestError::Other(anyhow::Error::from(err))),
             Ok(value) => {
                 info!("get value done");
 
