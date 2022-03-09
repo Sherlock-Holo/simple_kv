@@ -3,6 +3,8 @@ use std::path::Path;
 use prost_build::Config;
 
 fn main() {
+    println!("cargo:rerun-if-changed=proto");
+
     let builder = tonic_build::configure();
 
     let mut prost_config = Config::new();

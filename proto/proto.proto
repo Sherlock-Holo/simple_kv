@@ -14,8 +14,12 @@ service Raft {
   rpc send_message(RaftMessageRequest) returns (RaftMessageResponse) {}
 }
 
-message KvError {
+message KvOtherError {
   string detail = 1;
+}
+
+message KvNotLeader {
+  uint64 leader_id = 1;
 }
 
 message KvInsertRequest {
@@ -25,8 +29,9 @@ message KvInsertRequest {
 
 message KvInsertResponse {
   oneof result {
-    KvError error = 1;
-    google.protobuf.Empty success = 2;
+    KvOtherError error = 1;
+    KvNotLeader not_leader = 2;
+    google.protobuf.Empty success = 3;
   }
 }
 
@@ -40,8 +45,9 @@ message KvGetResponseValue {
 
 message KvGetResponse {
   oneof result {
-    KvError error = 1;
-    KvGetResponseValue value = 2;
+    KvOtherError error = 1;
+    KvNotLeader not_leader = 2;
+    KvGetResponseValue value = 3;
   }
 }
 
@@ -51,8 +57,9 @@ message KvDeleteRequest {
 
 message KvDeleteResponse {
   oneof result {
-    KvError error = 1;
-    google.protobuf.Empty success = 2;
+    KvOtherError error = 1;
+    KvNotLeader not_leader = 2;
+    google.protobuf.Empty success = 3;
   }
 }
 
