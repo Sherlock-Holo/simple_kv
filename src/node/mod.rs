@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use std::iter::Peekable;
+use std::collections::{HashMap, VecDeque};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bincode::{DefaultOptions, Options};
-use flume::{Receiver, Sender, TryIter};
+use flume::{Receiver, Sender};
 use prost07::Message as _;
 use protobuf::error::WireError;
 use protobuf::ProtobufError;
@@ -145,6 +145,7 @@ where
             tick_interval,
             key_value_backend: kv,
             proposal_request_queue,
+            proposal_request_reply_queue: Default::default(),
             get_request_queue,
         })
     }
@@ -167,8 +168,9 @@ where
     /// nodes append this entry which represent the proposal request, this entry will be committed
     ///
     /// when leader commits a proposal request entry, it only represent one proposal request, so we
-    /// can get the result sender from the proposal request queue to reply the client
+    /// can get the result sender from the proposal request reply queue to reply the client
     proposal_request_queue: Receiver<ProposalRequestReply>,
+    proposal_request_reply_queue: VecDeque<ProposalRequestReply>,
 
     get_request_queue: Receiver<GetRequestReply>,
 }
@@ -184,65 +186,69 @@ where
 
         let mut instant = Instant::now();
 
-        let proposal_request_queue = self.proposal_request_queue.clone();
-        let mut proposal_request_queue = proposal_request_queue.try_iter().peekable();
-
         loop {
-            self.run_a_cycle(&mut instant, &mut proposal_request_queue)?;
+            thread::sleep(Duration::from_millis(10));
+
+            self.run_a_cycle(&mut instant)?;
         }
     }
 
-    #[instrument(skip(self, proposal_request_queue), err)]
-    fn run_a_cycle(
-        &mut self,
-        instant: &mut Instant,
-        proposal_request_queue: &mut Peekable<TryIter<ProposalRequestReply>>,
-    ) -> anyhow::Result<()> {
+    #[instrument(skip(self), err)]
+    fn run_a_cycle(&mut self, instant: &mut Instant) -> anyhow::Result<()> {
+        let node_id = self.raw_node.raft.id;
+        let leader_id = self.raw_node.raft.leader_id;
+
+        if self.is_leader() {
+            info!(node_id, "node is leader");
+        }
+
         if self.get_request_queue.is_disconnected() {
-            error!("get request queue is disconnected");
+            error!(node_id, "get request queue is disconnected");
 
             return Err(anyhow::anyhow!("get request queue is disconnected"));
         }
 
-        if self.is_leader() {
+        if self.is_leader() && !self.get_request_queue.is_empty() {
             for reply in self.get_request_queue.clone().try_iter() {
                 self.handle_get(reply);
             }
 
-            info!("handle get request done");
-        } else {
+            info!(node_id, "handle get request done");
+        } else if leader_id != 0 && !self.get_request_queue.is_empty() {
+            // when leader_id = 0, means no leader is elected
             self.get_request_queue
                 .try_iter()
                 .into_iter()
                 .for_each(|reply| {
-                    let leader_id = self.raw_node.raft.leader_id;
-
-                    warn!(leader_id, "reject get request because node is not leader");
+                    warn!(
+                        node_id,
+                        leader_id, "reject get request because node is not leader"
+                    );
                     reply.reply(Err(RequestError::NotLeader(leader_id)))
                 });
         }
 
         if self.mailbox.is_disconnected() {
-            error!("mailbox is disconnected");
+            error!(node_id, "mailbox is disconnected");
 
             return Err(anyhow::anyhow!("mailbox is disconnected"));
         }
 
-        for msg in self.mailbox.clone().try_iter() {
+        for msg in self.mailbox.try_iter() {
             let from = msg.from;
 
-            info!(from, "get other node message done");
+            info!(node_id, from, "get other node message done");
 
             self.raw_node.step(msg).tap_err(|err| {
-                error!(%err, from, "step other node message failed");
+                error!(node_id, %err, from, "step other node message failed");
             })?;
 
-            info!(from, "step other node message done");
+            info!(node_id, from, "step other node message done");
         }
 
         let elapsed = instant.elapsed();
         if elapsed >= self.tick_interval {
-            info!(?elapsed, tick_interval = ?self.tick_interval, "elapsed >= tick_interval, tick the raw node");
+            info!(node_id, ?elapsed, tick_interval = ?self.tick_interval, "elapsed >= tick_interval, tick the raw node");
 
             self.raw_node.tick();
 
@@ -250,49 +256,53 @@ where
         }
 
         if self.proposal_request_queue.is_disconnected() {
-            error!("proposal request queue is disconnected");
+            error!(node_id, "proposal request queue is disconnected");
 
             return Err(anyhow::anyhow!("proposal request queue is disconnected"));
         }
 
-        if self.raw_node.raft.state != StateRole::Leader {
-            for reply in proposal_request_queue.by_ref() {
-                let leader_id = self.raw_node.raft.leader_id;
+        if self.is_leader() {
+            if let Some(mut reply) = self.proposal_request_queue.try_iter().next() {
+                if !reply.handling() {
+                    info!(node_id, "node is raft leader, handle proposal request");
 
+                    let key_value_operation = reply.handle();
+
+                    self.propose_key_value_operation(key_value_operation)?;
+
+                    info!(node_id, "propose key value operation done");
+
+                    self.proposal_request_reply_queue.push_back(reply);
+                }
+            }
+        } else if leader_id != 0 {
+            // when leader_id = 0, means no leader is elected
+            for reply in self.proposal_request_queue.try_iter() {
                 warn!(
-                    leader_id,
-                    "node is not raff leader, reject proposal request"
+                    node_id,
+                    leader_id, "node is not raff leader, reject proposal request"
                 );
 
                 reply.reply(Err(RequestError::NotLeader(leader_id)));
             }
-        } else if let Some(reply) = proposal_request_queue.peek_mut() {
-            if !reply.handling() {
-                info!("node is raft leader, handle proposal request");
-
-                let key_value_operation = reply.handle();
-
-                self.propose_key_value_operation(key_value_operation)?;
-
-                info!("propose key value operation done");
-            }
         }
 
         if !self.raw_node.has_ready() {
-            info!("node has no ready event");
+            info!(node_id, "node has no ready event");
 
             return Ok(());
         }
 
-        info!("node has ready event");
+        info!(node_id, "node has ready event");
 
         self.handle_ready()?;
 
-        info!("handle ready event done");
+        info!(node_id, "handle ready event done");
 
         Ok(())
     }
 
+    #[instrument(skip(self), err)]
     fn handle_ready(&mut self) -> anyhow::Result<()> {
         let mut ready = self.raw_node.ready();
 
@@ -314,6 +324,14 @@ where
             info!("apply snapshot done");
         }
 
+        for commit_entry in ready.take_committed_entries() {
+            self.apply_commit_entry(commit_entry)?;
+
+            info!("apply commit entry done");
+        }
+
+        info!("apply all commit entries done");
+
         let entries = ready
             .take_entries()
             .into_iter()
@@ -327,20 +345,12 @@ where
 
         info!("apply entries done");
 
-        for commit_entry in ready.take_committed_entries() {
-            self.apply_commit_entry(commit_entry)?;
-
-            info!("apply commit entry done");
-        }
-
-        info!("apply all commit entries done");
-
         if let Some(hard_state) = ready.hs() {
             self.raw_node
                 .mut_store()
                 .apply_hard_state(hard_state.clone().into())?;
 
-            info!("apply hard state done");
+            info!(?hard_state, "apply hard state done");
         }
 
         self.send_message_to_other_nodes(ready.take_persisted_messages())?;
@@ -376,10 +386,13 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self, key_value_operation), err)]
     fn propose_key_value_operation(
         &mut self,
         key_value_operation: KeyValueOperation,
     ) -> anyhow::Result<()> {
+        info!(op = ?key_value_operation.operation, "op");
+
         let key_value_operation = encoding()
             .serialize(&key_value_operation)
             .tap_err(|err| error!(%err, "serialize key value operation failed"))?;
@@ -393,6 +406,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self, messages), err)]
     fn send_message_to_other_nodes(
         &mut self,
         messages: Vec<eraftpb::Message>,
@@ -420,6 +434,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self, commit_entry), err)]
     fn apply_commit_entry(&mut self, commit_entry: eraftpb::Entry) -> anyhow::Result<()> {
         if commit_entry.data.is_empty() {
             info!("commit entry data is empty, skip it");
@@ -447,10 +462,16 @@ where
                     // when leader apply the commit entry, means the proposal request is accepted
                     // and committed, now can reply the client
                     if self.is_leader() {
-                        let mut proposal_request_queue =
-                            self.proposal_request_queue.try_iter().peekable();
+                        if let Some(reply) = self.proposal_request_reply_queue.pop_front() {
+                            if reply.handling() {
+                                info!("a proposal request can reply now");
 
-                        if let Some(reply) = proposal_request_queue.peek_mut() {
+                                reply.reply(Ok(()));
+
+                                info!("reply proposal request done");
+                            }
+                        }
+                        /*if let Some(reply) = proposal_request_queue.peek_mut() {
                             if reply.handling() {
                                 info!("a proposal request can reply now");
 
@@ -460,7 +481,7 @@ where
 
                                 info!("reply proposal request done");
                             }
-                        }
+                        }*/
                     }
 
                     return Ok(());
@@ -521,6 +542,7 @@ where
         self.raw_node.raft.state == StateRole::Leader
     }
 
+    #[instrument(skip(self, reply))]
     fn handle_get(&mut self, reply: GetRequestReply) {
         let result = match self.key_value_backend.get(reply.key()) {
             Err(err) => Err(RequestError::Other(anyhow::Error::from(err))),
@@ -543,108 +565,216 @@ fn encoding() -> impl Options + Copy {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::{env, thread};
 
     use tempfile::TempDir;
 
     use super::*;
     use crate::storage::key_value::rocksdb::RocksdbBackend as KvBackend;
+    use crate::storage::key_value::Operation;
     use crate::storage::log::rocksdb::RocksdbBackend as LogBackend;
 
     #[test]
-    fn test_new() {
-        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
-        let log_path = tmp_dir.path().join("log");
-        let kv_path = tmp_dir.path().join("kv");
+    fn full_test() {
+        // crate::init_log();
 
-        let kv_backend = KvBackend::create(&kv_path).unwrap();
+        let tmp_dir1 = TempDir::new_in(env::temp_dir()).unwrap();
+        let log_path1 = tmp_dir1.path().join("log1");
+        let kv_path1 = tmp_dir1.path().join("kv1");
 
-        let log_backend = LogBackend::create(
-            &log_path,
+        let tmp_dir2 = TempDir::new_in(env::temp_dir()).unwrap();
+        let log_path2 = tmp_dir2.path().join("log2");
+        let kv_path2 = tmp_dir2.path().join("kv2");
+
+        let tmp_dir3 = TempDir::new_in(env::temp_dir()).unwrap();
+        let log_path3 = tmp_dir3.path().join("log3");
+        let kv_path3 = tmp_dir3.path().join("kv3");
+
+        let kv_backend1 = KvBackend::create(&kv_path1).unwrap();
+
+        let log_backend1 = LogBackend::create(
+            &log_path1,
             ConfigState {
                 voters: vec![1, 2, 3],
                 ..Default::default()
             },
-            kv_backend.clone(),
+            kv_backend1.clone(),
         )
         .unwrap();
 
-        let mut builder = NodeBuilder::default();
+        let kv_backend2 = KvBackend::create(&kv_path2).unwrap();
 
-        let (_mailbox_sender, mailbox) = flume::unbounded();
-
-        let (node2_mailbox_sender, _node2_mailbox) = flume::unbounded();
-        let (node3_mailbox_sender, _node3_mailbox) = flume::unbounded();
-
-        let other_node_mailboxes =
-            HashMap::from([(2, node2_mailbox_sender), (3, node3_mailbox_sender)]);
-
-        let (_proposal_request_sender, proposal_request_queue) = flume::unbounded();
-        let (_get_request_sender, get_request_queue) = flume::unbounded();
-
-        builder
-            .config(Config::new(1))
-            .storage(log_backend)
-            .kv(kv_backend)
-            .mailbox(mailbox)
-            .other_node_mailboxes(other_node_mailboxes)
-            .proposal_request_queue(proposal_request_queue)
-            .get_request_queue(get_request_queue);
-
-        let _node = builder.build().unwrap();
-    }
-
-    #[test]
-    fn test_send_vote_request() {
-        let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
-        let log_path = tmp_dir.path().join("log");
-        let kv_path = tmp_dir.path().join("kv");
-
-        let kv_backend = KvBackend::create(&kv_path).unwrap();
-
-        let log_backend = LogBackend::create(
-            &log_path,
+        let log_backend2 = LogBackend::create(
+            &log_path2,
             ConfigState {
                 voters: vec![1, 2, 3],
                 ..Default::default()
             },
-            kv_backend.clone(),
+            kv_backend2.clone(),
         )
         .unwrap();
 
-        let mut builder = NodeBuilder::default();
+        let kv_backend3 = KvBackend::create(&kv_path3).unwrap();
 
-        let (_mailbox_sender, mailbox) = flume::unbounded();
+        let log_backend3 = LogBackend::create(
+            &log_path3,
+            ConfigState {
+                voters: vec![1, 2, 3],
+                ..Default::default()
+            },
+            kv_backend3.clone(),
+        )
+        .unwrap();
 
-        let (node2_mailbox_sender, node2_mailbox) = flume::unbounded();
-        let (node3_mailbox_sender, node3_mailbox) = flume::unbounded();
+        let mut backends = HashMap::from([
+            (1, (log_backend1, kv_backend1)),
+            (2, (log_backend2, kv_backend2)),
+            (3, (log_backend3, kv_backend3)),
+        ]);
 
-        let other_node_mailboxes =
-            HashMap::from([(2, node2_mailbox_sender), (3, node3_mailbox_sender)]);
+        let mut mailbox_senders = HashMap::new();
+        let mut mailboxes = HashMap::new();
+        let mut proposal_request_senders = HashMap::new();
+        let mut proposal_request_queues = HashMap::new();
+        let mut get_request_senders = HashMap::new();
+        let mut get_request_queues = HashMap::new();
 
-        let (_proposal_request_sender, proposal_request_queue) = flume::unbounded();
-        let (_get_request_sender, get_request_queue) = flume::unbounded();
+        for node_id in 1..=3 {
+            let (mailbox_sender, mailbox) = flume::unbounded();
 
-        builder
-            .config(Config::new(1))
-            .storage(log_backend)
-            .kv(kv_backend)
-            .mailbox(mailbox)
-            .other_node_mailboxes(other_node_mailboxes)
-            .proposal_request_queue(proposal_request_queue)
-            .get_request_queue(get_request_queue);
+            mailbox_senders.insert(node_id, mailbox_sender);
+            mailboxes.insert(node_id, mailbox);
 
-        let mut node = builder.build().unwrap();
+            let (proposal_request_sender, proposal_request_queue) = flume::unbounded();
+            proposal_request_senders.insert(node_id, proposal_request_sender);
+            proposal_request_queues.insert(node_id, proposal_request_queue);
 
-        thread::spawn(move || node.run());
+            let (get_request_sender, get_request_queue) = flume::unbounded();
+            get_request_senders.insert(node_id, get_request_sender);
+            get_request_queues.insert(node_id, get_request_queue);
+        }
 
-        // wait the node send vote request
-        thread::sleep(Duration::from_secs(5));
+        let mut nodes = vec![];
+        for node_id in 1..=3 {
+            let mut builder = NodeBuilder::default();
 
-        let node2_msg = node2_mailbox.try_recv().unwrap();
-        let node3_msg = node3_mailbox.try_recv().unwrap();
+            let (log_backend, kv_backend) = backends.remove(&node_id).unwrap();
+            let mailbox = mailboxes.remove(&node_id).unwrap();
 
-        dbg!(node2_msg);
-        dbg!(node3_msg);
+            let other_node_mailboxes = if node_id == 1 {
+                let mailbox2 = mailbox_senders.get(&2).unwrap().clone();
+                let mailbox3 = mailbox_senders.get(&3).unwrap().clone();
+
+                [(2, mailbox2), (3, mailbox3)]
+            } else if node_id == 2 {
+                let mailbox1 = mailbox_senders.get(&1).unwrap().clone();
+                let mailbox3 = mailbox_senders.get(&3).unwrap().clone();
+
+                [(1, mailbox1), (3, mailbox3)]
+            } else {
+                let mailbox1 = mailbox_senders.get(&1).unwrap().clone();
+                let mailbox2 = mailbox_senders.get(&2).unwrap().clone();
+
+                [(1, mailbox1), (2, mailbox2)]
+            }
+            .into();
+
+            let proposal_request_queue = proposal_request_queues.remove(&node_id).unwrap();
+            let get_request_queue = get_request_queues.remove(&node_id).unwrap();
+
+            builder
+                .config(Config::new(node_id))
+                .storage(log_backend)
+                .kv(kv_backend)
+                .mailbox(mailbox)
+                .other_node_mailboxes(other_node_mailboxes)
+                .proposal_request_queue(proposal_request_queue)
+                .get_request_queue(get_request_queue);
+
+            let node = builder.build().unwrap();
+
+            nodes.push(node);
+        }
+
+        for mut node in nodes {
+            thread::spawn(move || {
+                if let Err(err) = node.run() {
+                    error!(%err, "node stop with error");
+
+                    Err::<Infallible, _>(err)
+                } else {
+                    error!("node stop unexpected");
+
+                    Err(anyhow::anyhow!("node stop unexpected"))
+                }
+            });
+        }
+
+        let mut leader_id = 1;
+
+        loop {
+            dbg!(leader_id);
+
+            let sender = proposal_request_senders.get_mut(&leader_id).unwrap();
+
+            let (reply, result_receiver) = ProposalRequestReply::new(KeyValueOperation::new(
+                Operation::InsertOrUpdate,
+                b"test1".as_slice(),
+                b"test1".as_slice(),
+            ));
+
+            sender.send(reply).unwrap();
+
+            match result_receiver.recv().unwrap() {
+                Err(RequestError::NotLeader(new_leader)) => {
+                    dbg!(new_leader);
+
+                    leader_id = new_leader;
+
+                    thread::sleep(Duration::from_millis(100));
+
+                    continue;
+                }
+
+                Ok(_) => {
+                    eprintln!("proposal request done");
+
+                    break;
+                }
+
+                Err(err) => panic!("{}", err),
+            }
+        }
+
+        loop {
+            dbg!(leader_id);
+
+            let sender = get_request_senders.get_mut(&leader_id).unwrap();
+
+            let (reply, result_receiver) = GetRequestReply::new(b"test1".as_slice());
+
+            sender.send(reply).unwrap();
+
+            match result_receiver.recv().unwrap() {
+                Err(RequestError::NotLeader(new_leader)) => {
+                    dbg!(new_leader);
+
+                    leader_id = new_leader;
+
+                    thread::sleep(Duration::from_millis(100));
+
+                    continue;
+                }
+
+                Ok(value) => {
+                    println!("{}", String::from_utf8_lossy(&value.unwrap()));
+
+                    return;
+                }
+
+                Err(err) => panic!("{}", err),
+            }
+        }
     }
 }

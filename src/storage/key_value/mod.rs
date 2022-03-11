@@ -34,7 +34,7 @@ impl Serialize for Operation {
     where
         S: Serializer,
     {
-        let op = *self as u8;
+        let op = (*self).into();
 
         serializer.serialize_u8(op)
     }

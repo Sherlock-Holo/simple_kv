@@ -12,9 +12,7 @@ use tracing::instrument;
 use tracing::{error, info};
 
 use crate::storage::key_value::{KeyValueBackend, KeyValuePair};
-use crate::storage::log::{
-    ConfigState, Entry, EntryType, HardState, LogBackend, Snapshot, SnapshotMetadata,
-};
+use crate::storage::log::{ConfigState, Entry, HardState, LogBackend, Snapshot, SnapshotMetadata};
 
 type DataEncoding =
     WithOtherIntEncoding<WithOtherEndian<DefaultOptions, BigEndian>, VarintEncoding>;
@@ -117,7 +115,6 @@ where
             .tap_err(|err| error!(%err, "insert config state failed"))?;
 
         let snapshot_metadata = SnapshotMetadata::default();
-
         let snapshot_metadata = data_encoding.serialize(&snapshot_metadata).tap_err(
             |err| error!(%err, ?snapshot_metadata, "serialize snapshot metadata failed"),
         )?;
@@ -126,7 +123,6 @@ where
             .tap_err(|err| error!(%err, "insert snapshot metadata failed"))?;
 
         let snapshot_data = Vec::<KeyValuePair>::new();
-
         let snapshot_data = data_encoding
             .serialize(&snapshot_data)
             .tap_err(|err| error!(%err, "serialize emtpy snapshot data failed"))?;
@@ -210,12 +206,12 @@ where
 
         info!(?config_state, "serialize config state done");
 
-        let hard_state_data = encode_buf.get_mut().split();
+        let config_state_data = encode_buf.get_mut().split();
 
         match batch {
             None => self
                 .db
-                .put(CONFIG_STATE_PATH, hard_state_data)
+                .put(CONFIG_STATE_PATH, config_state_data)
                 .map_err(|err| {
                     error!(%err, ?config_state, "insert config state failed");
 
@@ -223,7 +219,7 @@ where
                 }),
 
             Some(batch) => {
-                batch.put(CONFIG_STATE_PATH, hard_state_data);
+                batch.put(CONFIG_STATE_PATH, config_state_data);
 
                 info!(?config_state, "insert config state to write batch done");
 
@@ -967,10 +963,6 @@ mod tests {
     use bytes::Bytes;
     use once_cell::sync::OnceCell;
     use tempfile::TempDir;
-    use tracing::level_filters::LevelFilter;
-    use tracing_subscriber::fmt::Layer;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::Registry;
 
     use super::*;
     use crate::storage::key_value::{KeyValueOperation, KeyValuePair, Operation};
@@ -980,11 +972,7 @@ mod tests {
         static INIT_LOG: OnceCell<()> = OnceCell::new();
 
         INIT_LOG.get_or_init(|| {
-            let layer = Layer::new().pretty();
-
-            let layered = Registry::default().with(layer).with(LevelFilter::INFO);
-
-            tracing::subscriber::set_global_default(layered).unwrap();
+            crate::init_log();
         });
     }
 

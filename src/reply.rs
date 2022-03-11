@@ -53,10 +53,16 @@ pub struct GetRequestReply {
 }
 
 impl GetRequestReply {
-    pub fn new(key: Bytes) -> (Self, Receiver<Result<Option<Bytes>, RequestError>>) {
+    pub fn new(key: impl Into<Bytes>) -> (Self, Receiver<Result<Option<Bytes>, RequestError>>) {
         let (result_sender, result_receiver) = flume::bounded(1);
 
-        (Self { key, result_sender }, result_receiver)
+        (
+            Self {
+                key: key.into(),
+                result_sender,
+            },
+            result_receiver,
+        )
     }
 
     pub fn key(&self) -> &[u8] {
