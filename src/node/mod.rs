@@ -1,4 +1,9 @@
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,6 +14,7 @@ use prost07::Message as _;
 use protobuf::error::WireError;
 use protobuf::ProtobufError;
 use raft::{eraftpb, Config, RawNode, StateRole, Storage};
+use rayon::prelude::*;
 use tap::TapFallible;
 use tracing::{error, info, instrument, warn};
 
@@ -25,6 +31,9 @@ pub struct NodeBuilder<KV, ST> {
     other_node_mailboxes: Option<HashMap<u64, Sender<eraftpb::Message>>>,
     proposal_request_queue: Option<Receiver<ProposalRequestReply>>,
     get_request_queue: Option<Receiver<GetRequestReply>>,
+
+    #[cfg(test)]
+    stop_signal: Option<Arc<AtomicBool>>,
 }
 
 impl<KV, ST> Default for NodeBuilder<KV, ST> {
@@ -38,6 +47,9 @@ impl<KV, ST> Default for NodeBuilder<KV, ST> {
             other_node_mailboxes: None,
             proposal_request_queue: None,
             get_request_queue: None,
+
+            #[cfg(test)]
+            stop_signal: None,
         }
     }
 }
@@ -87,6 +99,13 @@ impl<KV, ST> NodeBuilder<KV, ST> {
 
     pub fn get_request_queue(&mut self, get_request_queue: Receiver<GetRequestReply>) -> &mut Self {
         self.get_request_queue.replace(get_request_queue);
+
+        self
+    }
+
+    #[cfg(test)]
+    fn stop_signal(&mut self, stop_signal: Arc<AtomicBool>) -> &mut Self {
+        self.stop_signal.replace(stop_signal);
 
         self
     }
@@ -147,6 +166,9 @@ where
             proposal_request_queue,
             proposal_request_reply_queue: Default::default(),
             get_request_queue,
+
+            #[cfg(test)]
+            stop_signal: self.stop_signal.take().unwrap(),
         })
     }
 }
@@ -173,13 +195,17 @@ where
     proposal_request_reply_queue: VecDeque<ProposalRequestReply>,
 
     get_request_queue: Receiver<GetRequestReply>,
+
+    #[cfg(test)]
+    /// use for unit test to stop the node
+    stop_signal: Arc<AtomicBool>,
 }
 
 impl<KV, ST> Node<KV, ST>
 where
-    ST: Storage + LogBackend,
+    ST: Storage + LogBackend + Send + Sync,
     ST::Error: Send + Sync + 'static,
-    KV: KeyValueBackend,
+    KV: KeyValueBackend + Send + Sync,
 {
     pub fn run(&mut self) -> anyhow::Result<()> {
         info!("start node infinite running loop");
@@ -190,6 +216,13 @@ where
             thread::sleep(Duration::from_millis(10));
 
             self.run_a_cycle(&mut instant)?;
+
+            #[cfg(test)]
+            {
+                if self.stop_signal.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -534,7 +567,7 @@ where
     }
 
     #[instrument(skip(self, reply))]
-    fn handle_get(&mut self, reply: GetRequestReply) {
+    fn handle_get(&self, reply: GetRequestReply) {
         match self.key_value_backend.get(reply.key()) {
             Err(err) => {
                 reply.reply_err(RequestError::Other(anyhow::Error::from(err)));
@@ -556,22 +589,29 @@ where
         }
 
         if self.is_leader() && !self.get_request_queue.is_empty() {
-            for reply in self.get_request_queue.clone().try_iter() {
-                self.handle_get(reply);
-            }
+            self.get_request_queue
+                .clone()
+                .try_iter()
+                .par_bridge()
+                .for_each(|reply| {
+                    self.handle_get(reply);
+                });
 
             info!(node_id, "handle get request done");
         } else if leader_id != 0 {
             // when leader_id = 0, means no leader is elected
 
             // follower node data may not be latest, can't handle the get request
-            self.get_request_queue.try_iter().for_each(|reply| {
-                warn!(
-                    node_id,
-                    leader_id, "reject get request because node is not leader"
-                );
-                reply.reply_err(RequestError::NotLeader(leader_id))
-            });
+            self.get_request_queue
+                .try_iter()
+                .par_bridge()
+                .for_each(|reply| {
+                    warn!(
+                        node_id,
+                        leader_id, "reject get request because node is not leader"
+                    );
+                    reply.reply_err(RequestError::NotLeader(leader_id))
+                });
         }
 
         Ok(())
@@ -586,7 +626,6 @@ fn encoding() -> impl Options + Copy {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
     use std::{env, thread};
 
     use tempfile::TempDir;
@@ -676,6 +715,8 @@ mod tests {
             get_request_queues.insert(node_id, get_request_queue);
         }
 
+        let stop_signal = Arc::new(AtomicBool::new(false));
+
         let mut nodes = vec![];
         for node_id in 1..=3 {
             let mut builder = NodeBuilder::default();
@@ -711,26 +752,23 @@ mod tests {
                 .mailbox(mailbox)
                 .other_node_mailboxes(other_node_mailboxes)
                 .proposal_request_queue(proposal_request_queue)
-                .get_request_queue(get_request_queue);
+                .get_request_queue(get_request_queue)
+                .stop_signal(stop_signal.clone());
 
             let node = builder.build().unwrap();
 
             nodes.push(node);
         }
 
-        for mut node in nodes {
-            thread::spawn(move || {
-                if let Err(err) = node.run() {
-                    error!(%err, "node stop with error");
-
-                    Err::<Infallible, _>(err)
-                } else {
-                    error!("node stop unexpected");
-
-                    Err(anyhow::anyhow!("node stop unexpected"))
-                }
-            });
-        }
+        let join_handles = nodes
+            .into_iter()
+            .map(|mut node| {
+                thread::spawn(move || {
+                    node.run()
+                        .tap_err(|err| error!(%err, "node stop with error"))
+                })
+            })
+            .collect::<Vec<_>>();
 
         let mut leader_id = 1;
 
@@ -791,11 +829,17 @@ mod tests {
                 Ok(value) => {
                     println!("{}", String::from_utf8_lossy(&value.unwrap()));
 
-                    return;
+                    break;
                 }
 
                 Err(err) => panic!("{}", err),
             }
+        }
+
+        stop_signal.store(true, Ordering::Release);
+
+        for join_handle in join_handles {
+            let _ = join_handle.join();
         }
     }
 }

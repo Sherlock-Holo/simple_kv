@@ -1398,7 +1398,7 @@ mod tests {
             Ok(())
         }
 
-        fn get<S: AsRef<[u8]>>(&mut self, key: S) -> Result<Option<Bytes>, Self::Error> {
+        fn get<S: AsRef<[u8]>>(&self, key: S) -> Result<Option<Bytes>, Self::Error> {
             Ok(self.map.borrow_mut().get(key.as_ref()).cloned())
         }
 

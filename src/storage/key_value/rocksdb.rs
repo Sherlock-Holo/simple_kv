@@ -93,7 +93,7 @@ impl KeyValueBackend for RocksdbBackend {
     }
 
     #[instrument(skip(self, key), err)]
-    fn get<S: AsRef<[u8]>>(&mut self, key: S) -> Result<Option<Bytes>, Self::Error> {
+    fn get<S: AsRef<[u8]>>(&self, key: S) -> Result<Option<Bytes>, Self::Error> {
         let result = self
             .db
             .get(key)

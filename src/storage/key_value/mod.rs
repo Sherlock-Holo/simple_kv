@@ -140,7 +140,7 @@ pub trait KeyValueBackend {
     ) -> Result<(), Self::Error>;
 
     /// get the value by key
-    fn get<S: AsRef<[u8]>>(&mut self, key: S) -> Result<Option<Bytes>, Self::Error>;
+    fn get<S: AsRef<[u8]>>(&self, key: S) -> Result<Option<Bytes>, Self::Error>;
 
     // we use the KeyValuePair.key(String) to implement the PartialEq and Hash
     #[allow(clippy::mutable_key_type)]
