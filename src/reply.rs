@@ -32,18 +32,23 @@ impl ProposalRequestReply {
         )
     }
 
-    pub fn handling(&self) -> bool {
-        self.key_value_operation.is_none()
-    }
-
     pub fn handle(&mut self) -> KeyValueOperation {
         self.key_value_operation
             .take()
             .expect("key value operation is handled")
     }
 
-    pub fn reply(self, result: Result<(), RequestError>) {
-        let _ = self.result_sender.send(result);
+    pub fn reply(self) {
+        assert!(
+            self.key_value_operation.is_none(),
+            "key value operation is not handled"
+        );
+
+        let _ = self.result_sender.send(Ok(()));
+    }
+
+    pub fn reply_err(self, err: RequestError) {
+        let _ = self.result_sender.send(Err(err));
     }
 }
 
@@ -69,7 +74,11 @@ impl GetRequestReply {
         &self.key
     }
 
-    pub fn reply(self, result: Result<Option<Bytes>, RequestError>) {
-        let _ = self.result_sender.send(result);
+    pub fn reply(self, value: Option<Bytes>) {
+        let _ = self.result_sender.send(Ok(value));
+    }
+
+    pub fn reply_err(self, err: RequestError) {
+        let _ = self.result_sender.send(Err(err));
     }
 }
