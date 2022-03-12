@@ -25,8 +25,6 @@ use crate::storage::log::ConfigState;
 use crate::tokio_ext::TokioResultTaskExt;
 
 mod config;
-// mod example;
-// mod lib_example;
 mod node;
 mod reply;
 mod rpc;
