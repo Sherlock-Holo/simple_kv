@@ -393,6 +393,18 @@ where
 
                 reply.reply_err(RequestError::NotLeader(leader_id));
             }
+
+            // all handling proposal request need to be dropped
+            self.proposal_request_reply_queue
+                .drain(..)
+                .for_each(|reply| {
+                    warn!(
+                        node_id,
+                        leader_id, "node is not raff leader, reject proposal request"
+                    );
+
+                    reply.reply_err(RequestError::NotLeader(leader_id));
+                })
         }
 
         Ok(())

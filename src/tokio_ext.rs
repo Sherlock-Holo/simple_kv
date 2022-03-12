@@ -12,6 +12,7 @@ pub struct Flatten<O, E> {
 impl<O, E> Future for Flatten<O, E> {
     type Output = Result<O, E>;
 
+    #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Poll::Ready(ready!(self.join_handle.poll_unpin(cx)).unwrap())
     }
@@ -22,6 +23,7 @@ pub trait TokioResultTaskExt<O, E> {
 }
 
 impl<O, E> TokioResultTaskExt<O, E> for JoinHandle<Result<O, E>> {
+    #[inline]
     fn flatten_result(self) -> Flatten<O, E> {
         Flatten { join_handle: self }
     }
