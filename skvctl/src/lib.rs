@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::env;
 use std::env::VarError;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
+use std::{env, process};
 
 use anyhow::Context;
 use async_recursion::async_recursion;
@@ -32,11 +32,11 @@ fn get_nodes_from_env() -> HashMap<u64, Node> {
     };
 
     raw_nodes
-        .split(',')
+        .split(';')
         .map(|raw_node| {
-            let raw_node = raw_node.split(':').collect::<Vec<_>>();
+            let raw_node = raw_node.split(',').collect::<Vec<_>>();
             if raw_node.len() != 2 {
-                panic!("SKV_NODES format should be {{node_id:node_url,node_id:node_url}}");
+                panic!("SKV_NODES format should be {{node_id,node_url;node_id,node_url;}}");
             }
 
             let node_id = raw_node[0].parse::<u64>().expect("node_id format invalid");
@@ -56,11 +56,12 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     for &node_id in nodes.keys() {
-        if handle_operation(&args.operation, &nodes, node_id)
-            .await
-            .is_ok()
-        {
-            return Ok(());
+        match handle_operation(&args.operation, &nodes, node_id).await {
+            Err(err) => {
+                eprintln!("failed: {:?}", err);
+            }
+
+            Ok(_) => return Ok(()),
         }
     }
 
@@ -77,7 +78,7 @@ async fn handle_operation(
 
     let mut client = KvClient::connect(node.node_url.clone())
         .await
-        .context(format!("connect node {:?} failed", node))?;
+        .with_context(|| format!("connect node {:?} failed", node))?;
 
     match op {
         Operation::Insert { key, value } => {
@@ -93,10 +94,10 @@ async fn handle_operation(
                 None => {
                     println!("not found");
 
-                    Ok(())
+                    process::exit(1);
                 }
                 Some(value) => {
-                    println!("{}", value);
+                    println!("result:\n{}", value);
 
                     Ok(())
                 }
