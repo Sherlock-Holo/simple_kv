@@ -33,6 +33,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5d78ce20460b82d3fa150275ed9d55e21064fc7951177baacf86a145c4a4b1f"
 
 [[package]]
+name = "async-recursion"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cda8f4bcc10624c4e85bc66b3f452cca98cfa5ca002dc83a16aad2367641bea"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "async-stream"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1277,6 +1288,23 @@ dependencies = [
  "tonic-build",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "skvctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-recursion",
+ "bytes",
+ "clap",
+ "http",
+ "prost 0.9.0",
+ "prost-build 0.9.0",
+ "prost-types 0.9.0",
+ "tokio",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]

@@ -1,0 +1,23 @@
+[package]
+name = "skvctl"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+build = "build.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+tonic = "0.6"
+prost = "0.9"
+prost-types = "0.9"
+http = "0.2"
+bytes = "1"
+anyhow = "1"
+clap = { version = "3", features = ["derive"] }
+async-recursion = "1"
+
+[build-dependencies]
+tonic-build = "0.6"
+prost-build = "0.9"
