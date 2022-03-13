@@ -12,7 +12,6 @@ use serde::Deserialize;
 pub struct PeerConfig {
     pub node_id: u64,
     pub node_raft_url: String,
-    pub node_kv_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,9 +34,17 @@ impl Config {
 
         let mut node_ids = HashSet::with_capacity(self.peers.len() + 1);
         for peer_node_id in self.peers.iter().map(|peer| peer.node_id) {
+            if peer_node_id == 0 {
+                panic!("peer node id can't be 0");
+            }
+
             if !node_ids.insert(peer_node_id) {
                 panic!("peer node id {} is duplicated", peer_node_id);
             }
+        }
+
+        if self.node_id == 0 {
+            panic!("local node id can't be 0");
         }
 
         if !node_ids.insert(self.node_id) {
@@ -47,10 +54,6 @@ impl Config {
         self.peers.iter().for_each(|peer| {
             Uri::from_str(&peer.node_raft_url).unwrap_or_else(|err| {
                 panic!("node raft url {} is invalid: {}", peer.node_raft_url, err)
-            });
-
-            Uri::from_str(&peer.node_kv_url).unwrap_or_else(|err| {
-                panic!("node kv url {} is invalid: {}", peer.node_raft_url, err)
             });
         });
     }
