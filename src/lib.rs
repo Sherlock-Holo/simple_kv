@@ -60,7 +60,7 @@ pub async fn run() -> anyhow::Result<()> {
         .then(|(node_id, peer_cfg)| async move {
             let uri = peer_cfg.node_raft_url.parse::<Uri>().unwrap();
 
-            info!(node_id, %uri, "create node uri");
+            info!(node_id, %uri, "parse node uri done");
 
             let channel = Channel::builder(uri.clone()).connect().await?;
 
@@ -127,7 +127,7 @@ pub async fn run() -> anyhow::Result<()> {
         .storage(log_backend)
         .kv(kv_backend)
         .mailbox(mailbox)
-        .other_node_mailboxes(other_node_mailbox_senders)
+        .other_node_mailbox_senders(other_node_mailbox_senders)
         .proposal_request_queue(proposal_request_queue)
         .get_request_queue(get_request_queue);
 

@@ -28,7 +28,7 @@ pub struct NodeBuilder<KV, ST> {
     storage: Option<ST>,
     kv: Option<KV>,
     mailbox: Option<Receiver<eraftpb::Message>>,
-    other_node_mailboxes: Option<HashMap<u64, Sender<eraftpb::Message>>>,
+    other_node_mailbox_senders: Option<HashMap<u64, Sender<eraftpb::Message>>>,
     proposal_request_queue: Option<Receiver<ProposalRequestReply>>,
     get_request_queue: Option<Receiver<GetRequestReply>>,
 
@@ -44,7 +44,7 @@ impl<KV, ST> Default for NodeBuilder<KV, ST> {
             storage: None,
             kv: None,
             mailbox: None,
-            other_node_mailboxes: None,
+            other_node_mailbox_senders: None,
             proposal_request_queue: None,
             get_request_queue: None,
 
@@ -79,11 +79,12 @@ impl<KV, ST> NodeBuilder<KV, ST> {
         self
     }
 
-    pub fn other_node_mailboxes(
+    pub fn other_node_mailbox_senders(
         &mut self,
-        other_node_mailboxes: HashMap<u64, Sender<eraftpb::Message>>,
+        other_node_mailbox_senders: HashMap<u64, Sender<eraftpb::Message>>,
     ) -> &mut Self {
-        self.other_node_mailboxes.replace(other_node_mailboxes);
+        self.other_node_mailbox_senders
+            .replace(other_node_mailbox_senders);
 
         self
     }
@@ -138,7 +139,7 @@ where
             .with_context(|| anyhow!("mailbox is not set"))?;
 
         let other_node_mailboxes = self
-            .other_node_mailboxes
+            .other_node_mailbox_senders
             .take()
             .with_context(|| anyhow!("other_node_mailboxes is not set"))?;
 
@@ -724,7 +725,7 @@ mod tests {
             let (log_backend, kv_backend) = backends.remove(&node_id).unwrap();
             let mailbox = mailboxes.remove(&node_id).unwrap();
 
-            let other_node_mailboxes = if node_id == 1 {
+            let other_node_mailbox_senders = if node_id == 1 {
                 let mailbox2 = mailbox_senders.get(&2).unwrap().clone();
                 let mailbox3 = mailbox_senders.get(&3).unwrap().clone();
 
@@ -750,7 +751,7 @@ mod tests {
                 .storage(log_backend)
                 .kv(kv_backend)
                 .mailbox(mailbox)
-                .other_node_mailboxes(other_node_mailboxes)
+                .other_node_mailbox_senders(other_node_mailbox_senders)
                 .proposal_request_queue(proposal_request_queue)
                 .get_request_queue(get_request_queue)
                 .stop_signal(stop_signal.clone());
