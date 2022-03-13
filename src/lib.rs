@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use futures_util::{stream, try_join, StreamExt, TryStreamExt};
+use futures_util::{try_join, TryStreamExt};
 use http::Uri;
 use raft::Config;
 use rpc::kv::Rpc as KvRpc;
@@ -20,6 +20,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
 
 use crate::node::NodeBuilder;
+use crate::rpc::connect::Connector;
 use crate::rpc::raft::PeerNodeConfig;
 use crate::storage::log::ConfigState;
 use crate::tokio_ext::TokioResultTaskExt;
@@ -56,19 +57,18 @@ pub async fn run() -> anyhow::Result<()> {
         .map(|peer| (peer.node_id, peer))
         .collect::<HashMap<_, _>>();
 
-    let peers = stream::iter(peers)
-        .then(|(node_id, peer_cfg)| async move {
+    let peers = peers
+        .into_iter()
+        .map(|(node_id, peer_cfg)| {
             let uri = peer_cfg.node_raft_url.parse::<Uri>().unwrap();
 
             info!(node_id, %uri, "parse node uri done");
 
-            let channel = Channel::builder(uri.clone()).connect().await?;
+            let channel =
+                Channel::builder(uri.clone()).connect_with_connector_lazy(Connector::default())?;
 
-            info!(node_id, %uri, "connect channel done");
+            info!(node_id, %uri, "connect channel lazy done");
 
-            Ok::<_, anyhow::Error>((node_id, channel))
-        })
-        .map_ok(|(node_id, channel)| {
             let (mailbox_sender, mailbox) = flume::unbounded();
 
             let peer_node_config = PeerNodeConfig {
@@ -77,10 +77,9 @@ pub async fn run() -> anyhow::Result<()> {
                 mailbox,
             };
 
-            (node_id, (mailbox_sender, peer_node_config))
+            Ok((node_id, (mailbox_sender, peer_node_config)))
         })
-        .try_collect::<HashMap<_, _>>()
-        .await
+        .collect::<anyhow::Result<HashMap<_, _>>>()
         .tap_err(|err| error!(%err, "collect peer info failed"))?;
 
     info!(?peers, "collect peer info done");

@@ -22,9 +22,11 @@ protobuf = "2"
 tonic = "0.6"
 prost = "0.9"
 prost-types = "0.9"
+hyper = "0.14"
 http = "0.2"
+tower-service = "0.3"
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
 tokio-stream = { version = "0.1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
