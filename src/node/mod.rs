@@ -4,12 +4,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bincode::{DefaultOptions, Options};
-use flume::{Receiver, Sender, TryRecvError};
+use flume::select::SelectError;
+use flume::{Receiver, Sender};
+use message::ReceiveMessage;
 use prost07::Message as _;
 use protobuf::error::WireError;
 use protobuf::ProtobufError;
@@ -18,9 +19,12 @@ use rayon::prelude::*;
 use tap::TapFallible;
 use tracing::{error, info, instrument, warn};
 
+use crate::node::message::ContinueSelector;
 use crate::reply::{GetRequestReply, ProposalRequestReply, RequestError};
 use crate::storage::key_value::{KeyValueBackend, KeyValueOperation};
 use crate::storage::log::{ConfigState, Entry, EntryType, LogBackend, Snapshot};
+
+mod message;
 
 pub struct NodeBuilder<KV, ST> {
     config: Option<Config>,
@@ -214,8 +218,6 @@ where
         let mut instant = Instant::now();
 
         loop {
-            thread::sleep(Duration::from_millis(10));
-
             self.run_a_cycle(&mut instant)?;
 
             #[cfg(test)]
@@ -237,40 +239,83 @@ where
             return Err(anyhow::anyhow!("mailbox is disconnected"));
         }
 
-        for msg in self.mailbox.try_iter() {
-            let from = msg.from;
+        if self.get_request_queue.is_disconnected() {
+            error!(node_id, "get request queue is disconnected");
 
-            info!(node_id, from, "get other node message done");
-
-            self.raw_node.step(msg).tap_err(|err| {
-                error!(node_id, %err, from, "step other node message failed");
-            })?;
-
-            info!(node_id, from, "step other node message done");
+            return Err(anyhow::anyhow!("get request queue is disconnected"));
         }
 
-        let elapsed = instant.elapsed();
-        if elapsed >= self.tick_interval {
-            info!(node_id, ?elapsed, tick_interval = ?self.tick_interval, "elapsed >= tick_interval, tick the raw node");
+        if self.proposal_request_queue.is_disconnected() {
+            error!(node_id, "proposal request queue is disconnected");
 
-            self.raw_node.tick();
-
-            *instant = Instant::now();
+            return Err(anyhow::anyhow!("proposal request queue is disconnected"));
         }
 
-        let leader_id = self.raw_node.raft.leader_id;
+        match self.receive_all_messages() {
+            Err(_) => {
+                let elapsed = instant.elapsed();
+                if elapsed >= self.tick_interval {
+                    info!(
+                        node_id,
+                        ?elapsed,
+                        tick_interval = ?self.tick_interval,
+                        "elapsed >= tick_interval, tick the raw node"
+                    );
 
-        if self.is_leader() {
-            info!(node_id, "node is leader");
+                    self.raw_node.tick();
+
+                    *instant = Instant::now();
+                }
+
+                if self.is_leader() {
+                    info!(node_id, "node is leader");
+                }
+            }
+            Ok(all_messages) => {
+                let (raft_msgs, get_request_msgs, proposal_request_msg) =
+                    ReceiveMessage::split(all_messages);
+
+                for msg in raft_msgs {
+                    let from = msg.from;
+
+                    info!(node_id, from, "get other node message done");
+
+                    self.raw_node.step(msg).tap_err(|err| {
+                        error!(node_id, %err, from, "step other node message failed");
+                    })?;
+
+                    info!(node_id, from, "step other node message done");
+                }
+
+                let elapsed = instant.elapsed();
+                if elapsed >= self.tick_interval {
+                    info!(
+                        node_id,
+                        ?elapsed,
+                        tick_interval = ?self.tick_interval,
+                        "elapsed >= tick_interval, tick the raw node"
+                    );
+
+                    self.raw_node.tick();
+
+                    *instant = Instant::now();
+                }
+
+                let leader_id = self.raw_node.raft.leader_id;
+
+                if self.is_leader() {
+                    info!(node_id, "node is leader");
+                }
+
+                self.handle_get_requests(node_id, leader_id, get_request_msgs)?;
+
+                info!("handle get requests done");
+
+                self.handle_proposal_requests(node_id, leader_id, proposal_request_msg)?;
+
+                info!("handle proposal requests done");
+            }
         }
-
-        self.handle_get_requests(node_id, leader_id)?;
-
-        info!("handle get requests done");
-
-        self.handle_proposal_requests(node_id, leader_id)?;
-
-        info!("handle proposal requests done");
 
         if !self.raw_node.has_ready() {
             info!(node_id, "node has no ready event");
@@ -285,6 +330,16 @@ where
         info!(node_id, "handle ready event done");
 
         Ok(())
+    }
+
+    #[instrument(skip(self))]
+    fn receive_all_messages(&mut self) -> Result<Vec<ReceiveMessage>, SelectError> {
+        ContinueSelector::new(
+            &self.mailbox,
+            &self.get_request_queue,
+            &self.proposal_request_queue,
+        )
+        .wait_timeout(self.tick_interval)
     }
 
     #[instrument(skip(self), err)]
@@ -391,55 +446,65 @@ where
         Ok(())
     }
 
-    #[instrument(skip(self), err)]
-    fn handle_proposal_requests(&mut self, node_id: u64, leader_id: u64) -> anyhow::Result<()> {
+    #[instrument(skip(self, reply), err)]
+    fn handle_proposal_requests(
+        &mut self,
+        node_id: u64,
+        mut leader_id: u64,
+        reply: Option<ProposalRequestReply>,
+    ) -> anyhow::Result<()> {
         if self.is_leader() {
-            match self.proposal_request_queue.try_recv() {
-                Err(TryRecvError::Disconnected) => {
-                    error!(node_id, "proposal request queue is disconnected");
+            if let Some(mut reply) = reply {
+                info!(node_id, "node is raft leader, handle proposal request");
 
-                    return Err(anyhow::anyhow!("proposal request queue is disconnected"));
-                }
+                let key_value_operation = reply.handle();
 
-                Err(TryRecvError::Empty) => {}
+                self.propose_key_value_operation(key_value_operation)?;
 
-                Ok(mut reply) => {
-                    info!(node_id, "node is raft leader, handle proposal request");
+                info!(node_id, "propose key value operation done");
 
-                    let key_value_operation = reply.handle();
-
-                    self.propose_key_value_operation(key_value_operation)?;
-
-                    info!(node_id, "propose key value operation done");
-
-                    self.proposal_request_reply_queue.push_back(reply);
-                }
+                self.proposal_request_reply_queue.push_back(reply);
             }
-        } else if leader_id != 0 {
-            // when leader_id = 0, means no leader is elected
 
-            // follower node can't handle proposal request
-            for reply in self.proposal_request_queue.try_iter() {
+            return Ok(());
+        }
+
+        // when leader_id = 0, means no leader is elected
+        if leader_id == 0 {
+            // set leader_id to node_id to make sure client retry
+            leader_id = node_id;
+        }
+
+        // follower node can't handle proposal request
+        if let Some(reply) = reply {
+            warn!(
+                node_id,
+                leader_id, "node is not raff leader, reject proposal request"
+            );
+
+            reply.reply_err(RequestError::NotLeader(leader_id));
+        }
+
+        for reply in self.proposal_request_queue.try_iter() {
+            warn!(
+                node_id,
+                leader_id, "node is not raff leader, reject proposal request"
+            );
+
+            reply.reply_err(RequestError::NotLeader(leader_id));
+        }
+
+        // all handling proposal request need to be dropped
+        self.proposal_request_reply_queue
+            .drain(..)
+            .for_each(|reply| {
                 warn!(
                     node_id,
                     leader_id, "node is not raff leader, reject proposal request"
                 );
 
                 reply.reply_err(RequestError::NotLeader(leader_id));
-            }
-
-            // all handling proposal request need to be dropped
-            self.proposal_request_reply_queue
-                .drain(..)
-                .for_each(|reply| {
-                    warn!(
-                        node_id,
-                        leader_id, "node is not raff leader, reject proposal request"
-                    );
-
-                    reply.reply_err(RequestError::NotLeader(leader_id));
-                })
-        }
+            });
 
         Ok(())
     }
@@ -581,38 +646,33 @@ where
         }
     }
 
-    #[instrument(skip(self), err)]
-    fn handle_get_requests(&mut self, node_id: u64, leader_id: u64) -> anyhow::Result<()> {
-        if self.get_request_queue.is_disconnected() {
-            error!(node_id, "get request queue is disconnected");
-
-            return Err(anyhow::anyhow!("get request queue is disconnected"));
-        }
-
-        if self.is_leader() && !self.get_request_queue.is_empty() {
-            self.get_request_queue
-                .clone()
-                .try_iter()
-                .par_bridge()
-                .for_each(|reply| {
-                    self.handle_get(reply);
-                });
+    #[instrument(skip(self, get_request_messages), err)]
+    fn handle_get_requests(
+        &mut self,
+        node_id: u64,
+        mut leader_id: u64,
+        get_request_messages: Vec<GetRequestReply>,
+    ) -> anyhow::Result<()> {
+        if self.is_leader() {
+            get_request_messages.into_par_iter().for_each(|reply| {
+                self.handle_get(reply);
+            });
 
             info!(node_id, "handle get request done");
-        } else if leader_id != 0 {
-            // when leader_id = 0, means no leader is elected
+        } else {
+            // // set leader_id to node_id to make sure client retry
+            if leader_id == 0 {
+                leader_id = node_id;
+            }
 
             // follower node data may not be latest, can't handle the get request
-            self.get_request_queue
-                .try_iter()
-                .par_bridge()
-                .for_each(|reply| {
-                    warn!(
-                        node_id,
-                        leader_id, "reject get request because node is not leader"
-                    );
-                    reply.reply_err(RequestError::NotLeader(leader_id))
-                });
+            get_request_messages.into_par_iter().for_each(|reply| {
+                warn!(
+                    node_id,
+                    leader_id, "reject get request because node is not leader"
+                );
+                reply.reply_err(RequestError::NotLeader(leader_id))
+            });
         }
 
         Ok(())
