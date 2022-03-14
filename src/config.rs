@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use clap::{ColorChoice, Parser};
+use http::uri::Scheme;
 use http::Uri;
 use serde::Deserialize;
 
@@ -62,8 +63,17 @@ impl Config {
         }
 
         self.peers.iter().try_for_each(|peer| {
-            Uri::from_str(&peer.node_raft_url)
+            let uri = Uri::from_str(&peer.node_raft_url)
                 .with_context(|| format!("node raft url {} is invalid", peer.node_raft_url))?;
+
+            let scheme = uri
+                .scheme()
+                .with_context(|| "scheme should be http or https")?
+                .clone();
+
+            if scheme != Scheme::HTTP && scheme != Scheme::HTTPS {
+                return Err(anyhow::anyhow!("scheme should be http or https"));
+            }
 
             Ok::<_, anyhow::Error>(())
         })?;

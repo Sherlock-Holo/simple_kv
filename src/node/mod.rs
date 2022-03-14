@@ -327,7 +327,7 @@ where
 
         self.handle_ready()?;
 
-        info!(node_id, "handle ready event done");
+        debug!(node_id, "handle ready event done");
 
         Ok(())
     }
