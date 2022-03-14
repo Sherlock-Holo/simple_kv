@@ -32,18 +32,24 @@ mod rpc;
 mod storage;
 mod tokio_ext;
 
-fn init_log() {
+fn init_log(debug_log: bool) {
     let layer = Layer::new().pretty();
 
-    let layered = Registry::default().with(layer).with(LevelFilter::INFO);
+    let level = if debug_log {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::INFO
+    };
+
+    let layered = Registry::default().with(layer).with(level);
 
     tracing::subscriber::set_global_default(layered).unwrap();
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    init_log();
-
     let config = config::get_config()?;
+
+    init_log(config.debug_log);
 
     info!(?config, "get config done");
 
