@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::Path;
 
 use futures_util::{try_join, TryStreamExt};
@@ -33,7 +33,7 @@ mod storage;
 mod tokio_ext;
 
 fn init_log(debug_log: bool) {
-    let layer = Layer::new().pretty();
+    let layer = Layer::new().pretty().with_writer(io::stderr);
 
     let level = if debug_log {
         LevelFilter::DEBUG
