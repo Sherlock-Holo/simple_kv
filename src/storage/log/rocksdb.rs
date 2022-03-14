@@ -8,8 +8,7 @@ use bytes::{BufMut, BytesMut};
 use raft::{eraftpb, Error, RaftState, Storage, StorageError};
 use rocksdb::{ColumnFamily, WriteBatch, DB};
 use tap::TapFallible;
-use tracing::instrument;
-use tracing::{error, info};
+use tracing::{debug, error, info, instrument};
 
 use crate::storage::key_value::{KeyValueBackend, KeyValuePair};
 use crate::storage::log::{ConfigState, Entry, HardState, LogBackend, Snapshot, SnapshotMetadata};
@@ -299,11 +298,11 @@ where
         for delete_index in first_index..=hard_state.commit {
             let delete_entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, delete_index);
 
-            info!(delete_index, %delete_entry_path, "delete entry path");
+            debug!(delete_index, %delete_entry_path, "delete entry path");
 
             write_batch.delete_cf(column_family_handle, &delete_entry_path);
 
-            info!(delete_index, %delete_entry_path, "delete entry to write batch done");
+            debug!(delete_index, %delete_entry_path, "delete entry to write batch done");
         }
 
         let config_state = self.config_state()?;
@@ -335,7 +334,7 @@ where
 
         write_batch.put(SNAPSHOT_METADATA_PATH, new_snapshot_metadata_data);
 
-        info!("insert new snapshot metadata to write batch done");
+        debug!("insert new snapshot metadata to write batch done");
 
         let key_value_pairs = self.kv_backend.all().map_err(|err| {
             error!(%err, "get all key value pairs failed");
@@ -359,7 +358,7 @@ where
 
         write_batch.put(SNAPSHOT_DATA_PATH, new_snapshot_data.clone());
 
-        info!("insert new snapshot data to write batch done");
+        debug!("insert new snapshot data to write batch done");
 
         self.db.write(write_batch).map_err(|err| {
             error!(%err, "the whole update snapshot operation failed");
@@ -457,7 +456,7 @@ where
     #[instrument(skip(self, entries), err)]
     fn append_entries(&mut self, entries: Vec<Entry>) -> Result<(), Self::Error> {
         if entries.is_empty() {
-            info!("entries is empty");
+            debug!("entries is empty");
 
             return Ok(());
         }
@@ -488,14 +487,14 @@ where
 
         let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
 
-        let mut write_batch = WriteBatch::default();
-
         info!("get entries column family handle done");
+
+        let mut write_batch = WriteBatch::default();
 
         for delete_index in first_entry_index..=last_index {
             let delete_entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, delete_index);
 
-            info!(delete_index, %delete_entry_path, "delete entry path");
+            debug!(delete_index, %delete_entry_path, "delete entry path");
 
             if !self
                 .db
@@ -508,7 +507,7 @@ where
 
             write_batch.delete_cf(column_family_handle, &delete_entry_path);
 
-            info!(delete_index, %delete_entry_path, "delete entry in write batch done");
+            debug!(delete_index, %delete_entry_path, "delete entry in write batch done");
         }
 
         info!(
@@ -537,11 +536,11 @@ where
 
             let entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, entry_index);
 
-            info!(entry_index, %entry_path, "insert entry path");
+            debug!(entry_index, %entry_path, "insert entry path");
 
             write_batch.put_cf(column_family_handle, &entry_path, entry);
 
-            info!(entry_index, %entry_path, "insert entry in write batch done");
+            debug!(entry_index, %entry_path, "insert entry in write batch done");
         }
 
         self.data_encoding
@@ -651,17 +650,17 @@ where
 
         self.apply_hard_state_with_batch(&hard_state, Some(&mut write_batch), &mut buf)?;
 
-        info!(new_hard_state = ?hard_state, "insert new hard state to write batch done");
+        debug!(new_hard_state = ?hard_state, "insert new hard state to write batch done");
 
         if let Some(config_state) = &snapshot_metadata.config_state {
             self.apply_config_state_with_batch(config_state, Some(&mut write_batch), &mut buf)?;
 
-            info!(new_config_state = ?config_state, "insert new config state to write batch done");
+            debug!(new_config_state = ?config_state, "insert new config state to write batch done");
         }
 
         let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
 
-        info!("get entries column family handle done");
+        debug!("get entries column family handle done");
 
         for delete_index in first_index..=snapshot_index {
             let delete_entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, delete_index);
@@ -687,14 +686,14 @@ where
 
         write_batch.put(SNAPSHOT_METADATA_PATH, snapshot_metadata_data);
 
-        info!(
+        debug!(
             ?snapshot_metadata,
             "insert snapshot metadata to write batch done"
         );
 
         write_batch.put(SNAPSHOT_DATA_PATH, snapshot_data);
 
-        info!("insert snapshot data to write batch done");
+        debug!("insert snapshot data to write batch done");
 
         self.db.write(write_batch).map_err(|err| {
             error!(%err, "the whole apply snapshot operation failed");
@@ -765,7 +764,7 @@ where
 
         let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
 
-        info!("get entries column family handle done");
+        debug!("get entries column family handle done");
 
         for index in low..high {
             let entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, index);
@@ -829,21 +828,21 @@ where
         info!(?snapshot_metadata, "get snapshot metadata done");
 
         if snapshot_metadata.index == idx {
-            info!(idx, "the entry index == snapshot index");
+            debug!(idx, "the entry index == snapshot index");
 
             return Ok(snapshot_metadata.term);
         }
 
         let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
 
-        info!(
+        debug!(
             entries_clomn_family = ENTRIES_COLUMN_FAMILY,
             "get entries column family handle done"
         );
 
         let entry_path = format!("{}{}", ENTRIES_PATH_PREFIX, idx);
 
-        info!(idx, %entry_path, "get entry path done");
+        debug!(idx, %entry_path, "get entry path done");
 
         let entry = self
             .db
@@ -921,7 +920,7 @@ where
         info!("get snapshot metadata done");
 
         if snapshot_metadata.index == request_index {
-            info!(
+            debug!(
                 request_index,
                 snapshot_index = snapshot_metadata.index,
                 "request index == snapshot index"

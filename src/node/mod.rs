@@ -17,7 +17,7 @@ use protobuf::ProtobufError;
 use raft::{eraftpb, Config, RawNode, StateRole, Storage};
 use rayon::prelude::*;
 use tap::TapFallible;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::node::message::ContinueSelector;
 use crate::reply::{GetRequestReply, ProposalRequestReply, RequestError};
@@ -255,7 +255,7 @@ where
             Err(_) => {
                 let elapsed = instant.elapsed();
                 if elapsed >= self.tick_interval {
-                    info!(
+                    debug!(
                         node_id,
                         ?elapsed,
                         tick_interval = ?self.tick_interval,
@@ -268,7 +268,7 @@ where
                 }
 
                 if self.is_leader() {
-                    info!(node_id, "node is leader");
+                    debug!(node_id, "node is leader");
                 }
             }
             Ok(all_messages) => {
@@ -289,7 +289,7 @@ where
 
                 let elapsed = instant.elapsed();
                 if elapsed >= self.tick_interval {
-                    info!(
+                    debug!(
                         node_id,
                         ?elapsed,
                         tick_interval = ?self.tick_interval,
@@ -304,7 +304,7 @@ where
                 let leader_id = self.raw_node.raft.leader_id;
 
                 if self.is_leader() {
-                    info!(node_id, "node is leader");
+                    debug!(node_id, "node is leader");
                 }
 
                 self.handle_get_requests(node_id, leader_id, get_request_msgs)?;
@@ -318,12 +318,12 @@ where
         }
 
         if !self.raw_node.has_ready() {
-            info!(node_id, "node has no ready event");
+            debug!(node_id, "node has no ready event");
 
             return Ok(());
         }
 
-        info!(node_id, "node has ready event");
+        debug!(node_id, "node has ready event");
 
         self.handle_ready()?;
 
@@ -352,7 +352,7 @@ where
 
         let snapshot = ready.snapshot();
         if snapshot.metadata.is_some() && !snapshot.data.is_empty() {
-            info!("ready snapshot is not empty snapshot, need to apply");
+            debug!("ready snapshot is not empty snapshot, need to apply");
 
             let snapshot = Snapshot::try_from(snapshot)
                 .tap_err(|err| error!(%err, "convert rpc snapshot to log snapshot failed"))?;
@@ -431,8 +431,6 @@ where
         &mut self,
         key_value_operation: KeyValueOperation,
     ) -> anyhow::Result<()> {
-        info!(op = ?key_value_operation.operation, "op");
-
         let key_value_operation = encoding()
             .serialize(&key_value_operation)
             .tap_err(|err| error!(%err, "serialize key value operation failed"))?;
@@ -455,7 +453,7 @@ where
     ) -> anyhow::Result<()> {
         if self.is_leader() {
             if let Some(mut reply) = reply {
-                info!(node_id, "node is raft leader, handle proposal request");
+                debug!(node_id, "node is raft leader, handle proposal request");
 
                 let key_value_operation = reply.handle();
 
@@ -517,7 +515,7 @@ where
         for msg in messages {
             let to = msg.to;
 
-            info!(to, "message start send to node");
+            debug!(to, "message start send to node");
 
             match self.other_node_mailboxes.get(&to) {
                 None => {
@@ -540,7 +538,7 @@ where
     #[instrument(skip(self, commit_entry), err)]
     fn apply_commit_entry(&mut self, commit_entry: eraftpb::Entry) -> anyhow::Result<()> {
         if commit_entry.data.is_empty() {
-            info!("commit entry data is empty, skip it");
+            debug!("commit entry data is empty, skip it");
 
             return Ok(());
         }
@@ -566,7 +564,7 @@ where
                     // and committed, now can reply the client
                     if self.is_leader() {
                         if let Some(reply) = self.proposal_request_reply_queue.pop_front() {
-                            info!("a proposal request can reply now");
+                            debug!("a proposal request can reply now");
 
                             reply.reply();
 
@@ -639,7 +637,7 @@ where
                 reply.reply_err(RequestError::Other(anyhow::Error::from(err)));
             }
             Ok(value) => {
-                info!("get value done");
+                debug!("get value done");
 
                 reply.reply(value);
             }

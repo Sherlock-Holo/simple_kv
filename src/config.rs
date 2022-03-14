@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use anyhow::Context;
 use clap::{ColorChoice, Parser};
 use http::Uri;
 use serde::Deserialize;
@@ -20,42 +21,54 @@ pub struct Config {
     pub local_raft_listen_addr: SocketAddr,
     pub node_id: u64,
     pub data: PathBuf,
-
     pub peers: Vec<PeerConfig>,
+    #[serde(default)]
+    pub debug_log: bool,
 }
 
 impl Config {
-    fn valid(&self) {
+    fn valid(&self) -> anyhow::Result<()> {
         if self.peers.is_empty() {
-            panic!("not support single node");
+            return Err(anyhow::anyhow!("not support single node"));
         }
 
-        assert_ne!((self.peers.len() + 1) % 2, 0, "nodes number must be odd");
+        if (self.peers.len() + 1) % 2 == 0 {
+            return Err(anyhow::anyhow!("nodes number must be odd"));
+        }
 
         let mut node_ids = HashSet::with_capacity(self.peers.len() + 1);
         for peer_node_id in self.peers.iter().map(|peer| peer.node_id) {
             if peer_node_id == 0 {
-                panic!("peer node id can't be 0");
+                return Err(anyhow::anyhow!("peer node id can't be 0"));
             }
 
             if !node_ids.insert(peer_node_id) {
-                panic!("peer node id {} is duplicated", peer_node_id);
+                return Err(anyhow::anyhow!(
+                    "peer node id {} is duplicated",
+                    peer_node_id
+                ));
             }
         }
 
         if self.node_id == 0 {
-            panic!("local node id can't be 0");
+            return Err(anyhow::anyhow!("local node id can't be 0"));
         }
 
         if !node_ids.insert(self.node_id) {
-            panic!("local node id {} is duplicated", self.node_id);
+            return Err(anyhow::anyhow!(
+                "local node id {} is duplicated",
+                self.node_id
+            ));
         }
 
-        self.peers.iter().for_each(|peer| {
-            Uri::from_str(&peer.node_raft_url).unwrap_or_else(|err| {
-                panic!("node raft url {} is invalid: {}", peer.node_raft_url, err)
-            });
-        });
+        self.peers.iter().try_for_each(|peer| {
+            Uri::from_str(&peer.node_raft_url)
+                .with_context(|| format!("node raft url {} is invalid", peer.node_raft_url))?;
+
+            Ok::<_, anyhow::Error>(())
+        })?;
+
+        Ok(())
     }
 }
 
@@ -73,7 +86,7 @@ pub fn get_config() -> anyhow::Result<Config> {
 
     let config: Config = serde_yaml::from_reader(file)?;
 
-    config.valid();
+    config.valid()?;
 
     Ok(config)
 }

@@ -7,7 +7,7 @@ use raft::StorageError;
 use rocksdb::{IteratorMode, Options, WriteBatch, DB};
 use tap::TapFallible;
 use thiserror::Error;
-use tracing::{error, info, instrument};
+use tracing::{debug, error, info, instrument};
 
 use crate::storage::key_value::{KeyValueBackend, KeyValueOperation, KeyValuePair, Operation};
 
@@ -72,13 +72,13 @@ impl KeyValueBackend for RocksdbBackend {
                 Operation::InsertOrUpdate => {
                     write_batch.put(op.key, op.value);
 
-                    info!("insert or update key-value to write batch done");
+                    debug!("insert or update key-value to write batch done");
                 }
 
                 Operation::Delete => {
                     write_batch.delete(op.key);
 
-                    info!("delete key-value to write batch done");
+                    debug!("delete key-value to write batch done");
                 }
             }
         }
@@ -114,12 +114,12 @@ impl KeyValueBackend for RocksdbBackend {
             write_batch.delete(key);
         }
 
-        info!("delete all exists key-value to write batch done");
+        debug!("delete all exists key-value to write batch done");
 
         for pair in pairs {
             write_batch.put(pair.key, pair.value);
 
-            info!("insert key-value to write batch done");
+            debug!("insert key-value to write batch done");
         }
 
         info!("insert all key-value to write batch done");
