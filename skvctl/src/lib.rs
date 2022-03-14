@@ -92,12 +92,12 @@ async fn handle_operation(
             KVResult::NotLeader(leader) => handle_operation(op, nodes, leader).await,
             KVResult::Result(value) => match value {
                 None => {
-                    println!("not found");
+                    eprintln!("not found");
 
                     process::exit(1);
                 }
                 Some(value) => {
-                    println!("result:\n{}", value);
+                    println!("{}", value);
 
                     Ok(())
                 }
