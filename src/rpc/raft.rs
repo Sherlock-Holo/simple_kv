@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use flume::r#async::{RecvStream, SendSink};
@@ -11,6 +13,7 @@ use prost07::Message;
 use raft::eraftpb;
 use tap::TapFallible;
 use tokio::task::JoinHandle;
+use tokio::time;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, info_span, instrument, warn, Instrument};
@@ -27,12 +30,14 @@ pub struct PeerNodeConfig {
 }
 
 struct PeerNode {
+    id: u64,
     grpc_client: RaftClient<Channel>,
     mailbox: RecvStream<'static, eraftpb::Message>,
 }
 
 impl PeerNode {
     fn send_message_background(&self, message: eraftpb::Message) -> JoinHandle<anyhow::Result<()>> {
+        let peer_id = self.id;
         let mut grpc_client = self.grpc_client.clone();
 
         tokio::spawn(
@@ -47,14 +52,30 @@ impl PeerNode {
 
                 info!("encode raft message done");
 
-                grpc_client
-                    .send_message(RaftMessageRequest { message })
-                    .await
-                    .tap_err(|err| error!(%err, "send raft message to peer node failed"))?;
+                match time::timeout(
+                    Duration::from_secs(1),
+                    grpc_client.send_message(RaftMessageRequest { message }),
+                )
+                .await
+                {
+                    Err(_) => {
+                        error!(peer_id, "send raft message to peer timeout");
 
-                info!("send raft message to peer node done");
+                        return Err(anyhow::anyhow!("send raft message to peer timeout"));
+                    }
 
-                Ok::<_, anyhow::Error>(())
+                    Ok(Err(err)) => {
+                        error!(peer_id, %err, "send raft message to peer node failed");
+
+                        Err(err).context("send raft message to peer node failed")
+                    }
+
+                    Ok(Ok(_)) => {
+                        info!("send raft message to peer node done");
+
+                        Ok(())
+                    }
+                }
             }
             .instrument(info_span!("send_message")),
         )
@@ -120,6 +141,7 @@ impl Rpc {
                 (
                     config.id,
                     PeerNode {
+                        id: config.id,
                         grpc_client: RaftClient::new(config.channel),
                         mailbox: config.mailbox.into_stream(),
                     },
