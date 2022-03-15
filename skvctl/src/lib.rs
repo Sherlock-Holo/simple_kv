@@ -10,6 +10,8 @@ use bytes::Bytes;
 use clap::Parser;
 use clap::Subcommand;
 use http::Uri;
+use tokio::io;
+use tokio::io::AsyncWriteExt;
 use tonic::transport::Channel;
 
 use crate::pb::kv_client::KvClient;
@@ -91,13 +93,9 @@ async fn handle_operation(
         Operation::Get { key } => match get(&mut client, key.clone()).await? {
             KVResult::NotLeader(leader) => handle_operation(op, nodes, leader).await,
             KVResult::Result(value) => match value {
-                None => {
-                    eprintln!("not found");
-
-                    process::exit(1);
-                }
+                None => process::exit(1),
                 Some(value) => {
-                    println!("{}", value);
+                    io::stdout().write_all(&value).await?;
 
                     Ok(())
                 }
@@ -135,7 +133,7 @@ async fn insert(
 async fn get(
     client: &mut KvClient<Channel>,
     key: OsString,
-) -> anyhow::Result<KVResult<Option<String>>> {
+) -> anyhow::Result<KVResult<Option<Bytes>>> {
     let resp = client
         .get(KvGetRequest {
             key: Bytes::from(key.into_vec()),
@@ -148,11 +146,7 @@ async fn get(
         kv_get_response::Result::NotLeader(not_leader) => {
             Ok(KVResult::NotLeader(not_leader.leader_id))
         }
-        kv_get_response::Result::Value(value) => Ok(KVResult::Result(
-            value
-                .value
-                .map(|value| String::from_utf8_lossy(&value).to_string()),
-        )),
+        kv_get_response::Result::Value(value) => Ok(KVResult::Result(value.value)),
     }
 }
 
