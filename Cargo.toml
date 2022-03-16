@@ -10,7 +10,8 @@ build = "build.rs"
 [workspace]
 members = [
     ".",
-    "skvctl"
+    "skvctl",
+    "skvregistry"
 ]
 
 [dependencies]
