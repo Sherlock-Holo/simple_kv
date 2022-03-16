@@ -15,7 +15,7 @@ use tap::TapFallible;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tonic::transport::{Channel, Server};
-use tonic::{Request, Response, Status};
+use tonic::{IntoRequest, Request, Response, Status};
 use tracing::{error, info, info_span, instrument, warn, Instrument};
 
 use super::pb::*;
@@ -52,12 +52,12 @@ impl PeerNode {
 
                 info!("encode raft message done");
 
-                match time::timeout(
-                    Duration::from_secs(1),
-                    grpc_client.send_message(RaftMessageRequest { message }),
-                )
-                .await
-                {
+                let timeout = Duration::from_secs(1);
+
+                let mut request = RaftMessageRequest { message }.into_request();
+                request.set_timeout(timeout);
+
+                match time::timeout(timeout, grpc_client.send_message(request)).await {
                     Err(_) => {
                         error!(peer_id, "send raft message to peer timeout");
 
