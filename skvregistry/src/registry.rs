@@ -64,8 +64,10 @@ impl Register for Registry {
     #[instrument(skip(self), err)]
     async fn list_nodes(
         &self,
-        _request: Request<ListNodesRequest>,
+        request: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
+        let req = request.into_inner();
+
         let mut out_of_date_ids = vec![];
 
         let now = Instant::now();
@@ -73,6 +75,8 @@ impl Register for Registry {
         let nodes = self
             .nodes
             .iter()
+            // ignore self node
+            .filter(|node| *node.key() != req.self_node_id)
             .filter(|node| {
                 if node.deadline >= now {
                     return true;
@@ -159,13 +163,37 @@ mod tests {
             .unwrap();
 
         let resp = registry
-            .list_nodes(ListNodesRequest {}.into_request())
+            .list_nodes(ListNodesRequest { self_node_id: 100 }.into_request())
             .await
             .unwrap();
         let node = &resp.into_inner().node_list[0];
 
         assert_eq!(node.node_id, 1);
         assert_eq!(node.node_uri, "http://127.0.0.1/".to_string());
+    }
+
+    #[tokio::test]
+    async fn test_list_nodes_ignore_self() {
+        let registry = Registry::default();
+
+        registry
+            .register_node(
+                RegisterNodeRequest {
+                    node_id: 1,
+                    period: 1000,
+                    node_uri: "http://127.0.0.1".to_string(),
+                }
+                .into_request(),
+            )
+            .await
+            .unwrap();
+
+        let resp = registry
+            .list_nodes(ListNodesRequest { self_node_id: 1 }.into_request())
+            .await
+            .unwrap();
+
+        assert!(resp.into_inner().node_list.is_empty());
     }
 
     #[tokio::test]
@@ -187,7 +215,7 @@ mod tests {
         time::sleep(Duration::from_millis(100)).await;
 
         let resp = registry
-            .list_nodes(ListNodesRequest {}.into_request())
+            .list_nodes(ListNodesRequest { self_node_id: 100 }.into_request())
             .await
             .unwrap();
 

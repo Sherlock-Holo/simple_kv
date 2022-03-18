@@ -12,7 +12,9 @@ message RegisterNodeResponse {
   uint64 period = 1; // time unit is millisecond
 }
 
-message ListNodesRequest {}
+message ListNodesRequest {
+  uint64 self_node_id = 1;
+}
 
 message NodeInfo {
   uint64 node_id = 1;
