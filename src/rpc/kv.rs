@@ -10,9 +10,9 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, instrument, warn};
 
-use super::pb::*;
+use super::pb::simple_kv::*;
 use crate::reply::{GetRequestReply, ProposalRequestReply, RequestError};
-use crate::rpc::pb::kv_server::{Kv, KvServer};
+use crate::rpc::pb::simple_kv::kv_server::{Kv, KvServer};
 use crate::storage::key_value::{KeyValueOperation, Operation};
 
 pub struct Rpc {

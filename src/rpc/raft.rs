@@ -18,9 +18,9 @@ use tonic::transport::{Channel, Server};
 use tonic::{IntoRequest, Request, Response, Status};
 use tracing::{error, info, info_span, instrument, warn, Instrument};
 
-use super::pb::*;
-use crate::rpc::pb::raft_client::RaftClient;
-use crate::rpc::pb::raft_server::{Raft, RaftServer};
+use super::pb::simple_kv::*;
+use crate::rpc::pb::simple_kv::raft_client::RaftClient;
+use crate::rpc::pb::simple_kv::raft_server::{Raft, RaftServer};
 
 #[derive(Clone, Debug)]
 pub struct PeerNodeConfig {

@@ -10,13 +10,18 @@ fn main() {
     let mut prost_config = Config::new();
     prost_config.bytes(&["."]);
 
-    let proto_path = Path::new("proto/proto.proto");
+    let simple_kv_proto_path = Path::new("proto/proto.proto");
+    let registry_proto_path = Path::new("proto/register.proto");
 
-    let proto_dir = proto_path
+    let proto_dir = simple_kv_proto_path
         .parent()
         .expect("proto file should reside in a directory");
 
     builder
-        .compile_with_config(prost_config, &[proto_path], &[proto_dir])
+        .compile_with_config(
+            prost_config,
+            &[simple_kv_proto_path, registry_proto_path],
+            &[proto_dir],
+        )
         .unwrap();
 }
