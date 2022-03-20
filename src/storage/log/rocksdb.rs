@@ -47,11 +47,7 @@ where
     KV: KeyValueBackend,
     KV::Error: Into<Error>,
 {
-    pub fn from_exist(
-        db_path: &Path,
-        config_state: ConfigState,
-        kv_backend: KV,
-    ) -> anyhow::Result<Self> {
+    pub fn from_exist(db_path: &Path, kv_backend: KV) -> anyhow::Result<Self> {
         let db = DB::open_cf(
             &rocksdb::Options::default(),
             db_path,
@@ -67,24 +63,14 @@ where
             .with_big_endian()
             .with_varint_encoding();
 
-        let mut backend = Self {
+        Ok(Self {
             db,
             kv_backend,
             data_encoding,
-        };
-
-        backend
-            .apply_config_state(config_state.clone())
-            .tap_err(|err| {
-                error!(%err, ?config_state, "apply current config state failed");
-            })?;
-
-        info!(?config_state, "apply current config state done");
-
-        Ok(backend)
+        })
     }
 
-    pub fn create(path: &Path, config_state: ConfigState, kv_backend: KV) -> anyhow::Result<Self> {
+    pub fn create(path: &Path, kv_backend: KV) -> anyhow::Result<Self> {
         let mut options = rocksdb::Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
@@ -105,13 +91,6 @@ where
 
         db.put(HARD_STATE_PATH, hard_state)
             .tap_err(|err| error!(%err, "insert hard state failed"))?;
-
-        let config_state = data_encoding
-            .serialize(&config_state)
-            .tap_err(|err| error!(%err, ?config_state, "serialize config state failed"))?;
-
-        db.put(CONFIG_STATE_PATH, config_state)
-            .tap_err(|err| error!(%err, "insert config state failed"))?;
 
         let snapshot_metadata = SnapshotMetadata::default();
         let snapshot_metadata = data_encoding.serialize(&snapshot_metadata).tap_err(
@@ -971,7 +950,7 @@ mod tests {
         static INIT_LOG: OnceCell<()> = OnceCell::new();
 
         INIT_LOG.get_or_init(|| {
-            crate::init_log();
+            crate::init_log(true);
         });
     }
 
@@ -989,7 +968,11 @@ mod tests {
         path: &Path,
         config_state: ConfigState,
     ) -> RocksdbBackend<TestKVBackend> {
-        RocksdbBackend::create(path, config_state, TestKVBackend::default()).unwrap()
+        let mut backend = RocksdbBackend::create(path, TestKVBackend::default()).unwrap();
+
+        backend.apply_config_state(config_state).unwrap();
+
+        backend
     }
 
     fn create_backend_with_kv_backend_and_config_state<KV>(
@@ -1001,7 +984,11 @@ mod tests {
         KV: KeyValueBackend,
         KV::Error: Into<Error>,
     {
-        RocksdbBackend::create(path, config_state, kv).unwrap()
+        let mut backend = RocksdbBackend::create(path, kv).unwrap();
+
+        backend.apply_config_state(config_state).unwrap();
+
+        backend
     }
 
     #[test]
@@ -1019,12 +1006,7 @@ mod tests {
         let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
         create_backend(tmp_dir.path());
 
-        RocksdbBackend::from_exist(
-            tmp_dir.path(),
-            ConfigState::default(),
-            TestKVBackend::default(),
-        )
-        .unwrap();
+        RocksdbBackend::from_exist(tmp_dir.path(), TestKVBackend::default()).unwrap();
     }
 
     #[test]

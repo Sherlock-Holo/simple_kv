@@ -1,8 +1,6 @@
-use std::collections::HashSet;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use anyhow::Context;
 use clap::{ColorChoice, Parser};
@@ -11,72 +9,48 @@ use http::Uri;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-pub struct PeerConfig {
-    pub node_id: u64,
-    pub node_raft_url: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct Config {
     pub local_kv_listen_addr: SocketAddr,
     pub local_raft_listen_addr: SocketAddr,
+    pub node_uri: String,
     pub node_id: u64,
     pub data: PathBuf,
-    pub peers: Vec<PeerConfig>,
+    pub registry_uri: String,
     #[serde(default)]
     pub debug_log: bool,
 }
 
 impl Config {
     fn valid(&self) -> anyhow::Result<()> {
-        if self.peers.is_empty() {
-            return Err(anyhow::anyhow!("not support single node"));
-        }
-
-        if (self.peers.len() + 1) % 2 == 0 {
-            return Err(anyhow::anyhow!("nodes number must be odd"));
-        }
-
-        let mut node_ids = HashSet::with_capacity(self.peers.len() + 1);
-        for peer_node_id in self.peers.iter().map(|peer| peer.node_id) {
-            if peer_node_id == 0 {
-                return Err(anyhow::anyhow!("peer node id can't be 0"));
-            }
-
-            if !node_ids.insert(peer_node_id) {
-                return Err(anyhow::anyhow!(
-                    "peer node id {} is duplicated",
-                    peer_node_id
-                ));
-            }
-        }
-
         if self.node_id == 0 {
             return Err(anyhow::anyhow!("local node id can't be 0"));
         }
 
-        if !node_ids.insert(self.node_id) {
-            return Err(anyhow::anyhow!(
-                "local node id {} is duplicated",
-                self.node_id
-            ));
+        let node_uri = self
+            .node_uri
+            .parse::<Uri>()
+            .with_context(|| format!("node uri {} is invalid", self.node_uri))?;
+
+        let node_uri_scheme = node_uri
+            .scheme()
+            .with_context(|| "scheme should be http or https")?;
+
+        if *node_uri_scheme != Scheme::HTTP && *node_uri_scheme != Scheme::HTTPS {
+            return Err(anyhow::anyhow!("scheme should be http or https"));
         }
 
-        self.peers.iter().try_for_each(|peer| {
-            let uri = Uri::from_str(&peer.node_raft_url)
-                .with_context(|| format!("node raft url {} is invalid", peer.node_raft_url))?;
+        let registry_uri = self
+            .registry_uri
+            .parse::<Uri>()
+            .with_context(|| format!("registry uri {} is invalid", self.registry_uri))?;
 
-            let scheme = uri
-                .scheme()
-                .with_context(|| "scheme should be http or https")?
-                .clone();
+        let scheme = registry_uri
+            .scheme()
+            .with_context(|| "scheme should be http or https")?;
 
-            if scheme != Scheme::HTTP && scheme != Scheme::HTTPS {
-                return Err(anyhow::anyhow!("scheme should be http or https"));
-            }
-
-            Ok::<_, anyhow::Error>(())
-        })?;
+        if *scheme != Scheme::HTTP && *scheme != Scheme::HTTPS {
+            return Err(anyhow::anyhow!("scheme should be http or https"));
+        }
 
         Ok(())
     }

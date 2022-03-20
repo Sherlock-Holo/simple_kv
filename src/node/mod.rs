@@ -21,6 +21,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::node::message::ContinueSelector;
 use crate::reply::{GetRequestReply, ProposalRequestReply, RequestError};
+use crate::rpc::register::NodeChangeEvent;
 use crate::storage::key_value::{KeyValueBackend, KeyValueOperation};
 use crate::storage::log::{ConfigState, Entry, EntryType, LogBackend, Snapshot};
 
@@ -32,9 +33,9 @@ pub struct NodeBuilder<KV, ST> {
     storage: Option<ST>,
     kv: Option<KV>,
     mailbox: Option<Receiver<eraftpb::Message>>,
-    other_node_mailbox_senders: Option<HashMap<u64, Sender<eraftpb::Message>>>,
     proposal_request_queue: Option<Receiver<ProposalRequestReply>>,
     get_request_queue: Option<Receiver<GetRequestReply>>,
+    node_change_event_receiver: Option<Receiver<NodeChangeEvent>>,
 
     #[cfg(test)]
     stop_signal: Option<Arc<AtomicBool>>,
@@ -48,9 +49,9 @@ impl<KV, ST> Default for NodeBuilder<KV, ST> {
             storage: None,
             kv: None,
             mailbox: None,
-            other_node_mailbox_senders: None,
             proposal_request_queue: None,
             get_request_queue: None,
+            node_change_event_receiver: None,
 
             #[cfg(test)]
             stop_signal: None,
@@ -83,16 +84,6 @@ impl<KV, ST> NodeBuilder<KV, ST> {
         self
     }
 
-    pub fn other_node_mailbox_senders(
-        &mut self,
-        other_node_mailbox_senders: HashMap<u64, Sender<eraftpb::Message>>,
-    ) -> &mut Self {
-        self.other_node_mailbox_senders
-            .replace(other_node_mailbox_senders);
-
-        self
-    }
-
     pub fn proposal_request_queue(
         &mut self,
         proposal_request_queue: Receiver<ProposalRequestReply>,
@@ -104,6 +95,16 @@ impl<KV, ST> NodeBuilder<KV, ST> {
 
     pub fn get_request_queue(&mut self, get_request_queue: Receiver<GetRequestReply>) -> &mut Self {
         self.get_request_queue.replace(get_request_queue);
+
+        self
+    }
+
+    pub fn node_change_event_receiver(
+        &mut self,
+        node_change_event_receiver: Receiver<NodeChangeEvent>,
+    ) -> &mut Self {
+        self.node_change_event_receiver
+            .replace(node_change_event_receiver);
 
         self
     }
@@ -142,11 +143,6 @@ where
             .take()
             .with_context(|| anyhow!("mailbox is not set"))?;
 
-        let other_node_mailboxes = self
-            .other_node_mailbox_senders
-            .take()
-            .with_context(|| anyhow!("other_node_mailboxes is not set"))?;
-
         let proposal_request_queue = self
             .proposal_request_queue
             .take()
@@ -157,6 +153,11 @@ where
             .take()
             .with_context(|| anyhow!("get_request_queue is not set"))?;
 
+        let node_change_event_receiver = self
+            .node_change_event_receiver
+            .take()
+            .with_context(|| anyhow!("node_change_event_receiver is not set"))?;
+
         let raw_node = RawNode::with_default_logger(&config, storage)
             .tap_err(|err| error!(%err, "init raw node failed"))?;
 
@@ -164,13 +165,14 @@ where
 
         Ok(Node {
             mailbox,
-            other_node_mailboxes,
+            other_node_mailboxes: Default::default(),
             raw_node,
             tick_interval,
             key_value_backend: kv,
             proposal_request_queue,
             proposal_request_reply_queue: Default::default(),
             get_request_queue,
+            node_change_event_receiver,
 
             #[cfg(test)]
             stop_signal: self.stop_signal.take().unwrap(),
@@ -201,6 +203,8 @@ where
 
     get_request_queue: Receiver<GetRequestReply>,
 
+    node_change_event_receiver: Receiver<NodeChangeEvent>,
+
     #[cfg(test)]
     /// use for unit test to stop the node
     stop_signal: Arc<AtomicBool>,
@@ -213,6 +217,10 @@ where
     KV: KeyValueBackend + Send + Sync,
 {
     pub fn run(&mut self) -> anyhow::Result<()> {
+        self.wait_other_nodes_online()?;
+
+        info!("wait other nodes online done");
+
         info!("start node infinite running loop");
 
         let mut instant = Instant::now();
@@ -227,6 +235,53 @@ where
                 }
             }
         }
+    }
+
+    fn wait_other_nodes_online(&mut self) -> anyhow::Result<()> {
+        while self.other_node_mailboxes.is_empty() {
+            let first_event = match self.node_change_event_receiver.recv() {
+                Err(_) => {
+                    error!("node change event receiver closed");
+
+                    return Err(anyhow::anyhow!("node change event receiver closed"));
+                }
+
+                Ok(event) => event,
+            };
+
+            let mut events = self
+                .node_change_event_receiver
+                .try_iter()
+                .collect::<VecDeque<_>>();
+            events.push_front(first_event);
+            let events = events.into_iter().collect();
+
+            info!("receive node change event to init node done");
+
+            self.handle_node_change_events(events)?;
+
+            info!("add nodes done");
+        }
+
+        let mut nodes = self
+            .other_node_mailboxes
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        nodes.push(self.raw_node.raft.id);
+
+        info!(?nodes, "get all node ids");
+
+        let config_state = ConfigState {
+            voters: nodes,
+            ..Default::default()
+        };
+
+        self.raw_node.mut_store().apply_config_state(config_state)?;
+
+        info!("apply config state done");
+
+        Ok(())
     }
 
     #[instrument(skip(self), err)]
@@ -272,7 +327,7 @@ where
                 }
             }
             Ok(all_messages) => {
-                let (raft_msgs, get_request_msgs, proposal_request_msg) =
+                let (raft_msgs, get_request_msgs, proposal_request_msg, node_change_events) =
                     ReceiveMessage::split(all_messages);
 
                 for msg in raft_msgs {
@@ -300,6 +355,10 @@ where
 
                     *instant = Instant::now();
                 }
+
+                self.handle_node_change_events(node_change_events)?;
+
+                debug!("handle node change events done");
 
                 let leader_id = self.raw_node.raft.leader_id;
 
@@ -338,6 +397,7 @@ where
             &self.mailbox,
             &self.get_request_queue,
             &self.proposal_request_queue,
+            &self.node_change_event_receiver,
         )
         .wait_timeout(self.tick_interval)
     }
@@ -440,6 +500,56 @@ where
         self.raw_node
             .propose(vec![], key_value_operation)
             .tap_err(|err| error!(%err, "raw node propose key value operation failed"))?;
+
+        Ok(())
+    }
+
+    fn handle_node_change_events(&mut self, events: Vec<NodeChangeEvent>) -> anyhow::Result<()> {
+        let mut config_change = eraftpb::ConfChangeV2 {
+            transition: eraftpb::ConfChangeTransition::Auto as _,
+            ..Default::default()
+        };
+
+        for event in events {
+            info!(?event, "handle node change event");
+
+            match event {
+                NodeChangeEvent::Add {
+                    node_id,
+                    mut mailbox_sender,
+                } => {
+                    self.other_node_mailboxes.insert(
+                        node_id,
+                        mailbox_sender.take().expect("mailbox sender is none"),
+                    );
+
+                    info!(node_id, "add node to other node mailboxes done");
+
+                    config_change.changes.push(eraftpb::ConfChangeSingle {
+                        change_type: eraftpb::ConfChangeType::AddNode as _,
+                        node_id,
+                    });
+                }
+
+                NodeChangeEvent::Remove { node_id } => {
+                    self.other_node_mailboxes.remove(&node_id);
+
+                    info!(node_id, "remove node from other node mailboxes done");
+
+                    config_change.changes.push(eraftpb::ConfChangeSingle {
+                        change_type: eraftpb::ConfChangeType::RemoveNode as _,
+                        node_id,
+                    });
+                }
+            }
+        }
+
+        // only leader can propose a conf change
+        if self.is_leader() {
+            self.raw_node
+                .propose_conf_change(vec![], config_change)
+                .tap_err(|err| error!(?err, "propose config change failed"))?;
+        }
 
         Ok(())
     }
@@ -685,7 +795,7 @@ fn encoding() -> impl Options + Copy {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, thread};
+    use std::{env, mem, thread};
 
     use tempfile::TempDir;
 
@@ -693,10 +803,11 @@ mod tests {
     use crate::storage::key_value::rocksdb::RocksdbBackend as KvBackend;
     use crate::storage::key_value::Operation;
     use crate::storage::log::rocksdb::RocksdbBackend as LogBackend;
+    use crate::storage::log::LogBackend as _;
 
     #[test]
     fn full_test() {
-        // crate::init_log();
+        // crate::init_log(true);
 
         let tmp_dir1 = TempDir::new_in(env::temp_dir()).unwrap();
         let log_path1 = tmp_dir1.path().join("log1");
@@ -712,39 +823,15 @@ mod tests {
 
         let kv_backend1 = KvBackend::create(&kv_path1).unwrap();
 
-        let log_backend1 = LogBackend::create(
-            &log_path1,
-            ConfigState {
-                voters: vec![1, 2, 3],
-                ..Default::default()
-            },
-            kv_backend1.clone(),
-        )
-        .unwrap();
+        let log_backend1 = LogBackend::create(&log_path1, kv_backend1.clone()).unwrap();
 
         let kv_backend2 = KvBackend::create(&kv_path2).unwrap();
 
-        let log_backend2 = LogBackend::create(
-            &log_path2,
-            ConfigState {
-                voters: vec![1, 2, 3],
-                ..Default::default()
-            },
-            kv_backend2.clone(),
-        )
-        .unwrap();
+        let log_backend2 = LogBackend::create(&log_path2, kv_backend2.clone()).unwrap();
 
         let kv_backend3 = KvBackend::create(&kv_path3).unwrap();
 
-        let log_backend3 = LogBackend::create(
-            &log_path3,
-            ConfigState {
-                voters: vec![1, 2, 3],
-                ..Default::default()
-            },
-            kv_backend3.clone(),
-        )
-        .unwrap();
+        let log_backend3 = LogBackend::create(&log_path3, kv_backend3.clone()).unwrap();
 
         let mut backends = HashMap::from([
             (1, (log_backend1, kv_backend1)),
@@ -752,12 +839,23 @@ mod tests {
             (3, (log_backend3, kv_backend3)),
         ]);
 
+        // to skip the wait other nodes online
+        for (log_backend, _) in backends.values_mut() {
+            log_backend
+                .apply_config_state(ConfigState {
+                    voters: vec![1, 2, 3],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
         let mut mailbox_senders = HashMap::new();
         let mut mailboxes = HashMap::new();
         let mut proposal_request_senders = HashMap::new();
         let mut proposal_request_queues = HashMap::new();
         let mut get_request_senders = HashMap::new();
         let mut get_request_queues = HashMap::new();
+        let mut node_change_event_receivers = HashMap::new();
 
         for node_id in 1..=3 {
             let (mailbox_sender, mailbox) = flume::unbounded();
@@ -772,6 +870,12 @@ mod tests {
             let (get_request_sender, get_request_queue) = flume::unbounded();
             get_request_senders.insert(node_id, get_request_sender);
             get_request_queues.insert(node_id, get_request_queue);
+
+            let (node_change_event_sender, node_change_event_receiver) = flume::unbounded();
+            node_change_event_receivers.insert(node_id, node_change_event_receiver);
+
+            // ignore receiver recv failed, here we don't need to send node change event
+            mem::forget(node_change_event_sender);
         }
 
         let stop_signal = Arc::new(AtomicBool::new(false));
@@ -803,18 +907,22 @@ mod tests {
 
             let proposal_request_queue = proposal_request_queues.remove(&node_id).unwrap();
             let get_request_queue = get_request_queues.remove(&node_id).unwrap();
+            let node_change_event_receiver = node_change_event_receivers.remove(&node_id).unwrap();
 
             builder
                 .config(Config::new(node_id))
                 .storage(log_backend)
                 .kv(kv_backend)
                 .mailbox(mailbox)
-                .other_node_mailbox_senders(other_node_mailbox_senders)
                 .proposal_request_queue(proposal_request_queue)
                 .get_request_queue(get_request_queue)
+                .node_change_event_receiver(node_change_event_receiver)
                 .stop_signal(stop_signal.clone());
 
-            let node = builder.build().unwrap();
+            let mut node = builder.build().unwrap();
+
+            // todo for test
+            node.other_node_mailboxes = other_node_mailbox_senders;
 
             nodes.push(node);
         }

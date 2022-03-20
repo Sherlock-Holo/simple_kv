@@ -18,16 +18,12 @@ use tonic::transport::{Channel, Server};
 use tonic::{IntoRequest, Request, Response, Status};
 use tracing::{error, info, info_span, instrument, warn, Instrument};
 
+use super::connect::Connector;
+use super::pb::simple_kv::raft_client::RaftClient;
+use super::pb::simple_kv::raft_server::{Raft, RaftServer};
 use super::pb::simple_kv::*;
-use crate::rpc::pb::simple_kv::raft_client::RaftClient;
-use crate::rpc::pb::simple_kv::raft_server::{Raft, RaftServer};
-
-#[derive(Clone, Debug)]
-pub struct PeerNodeConfig {
-    pub id: u64,
-    pub channel: Channel,
-    pub mailbox: Receiver<eraftpb::Message>,
-}
+use super::register::RpcRaftNodeEvent;
+use crate::stream_ext::select_either;
 
 struct PeerNode {
     id: u64,
@@ -123,36 +119,24 @@ pub struct Rpc {
     grpc_listen_addr: SocketAddr,
     local_node: Option<LocalNode>,
     peer_nodes: HashMap<u64, PeerNode>,
+    rpc_raft_node_change_event_receiver: Receiver<RpcRaftNodeEvent>,
 }
 
 impl Rpc {
     pub fn new(
         listen_addr: SocketAddr,
         raft_message_sender: Sender<eraftpb::Message>,
-        peer_node_configs: Vec<PeerNodeConfig>,
+        rpc_raft_node_change_event_receiver: Receiver<RpcRaftNodeEvent>,
     ) -> Self {
         let local_node = LocalNode {
             raft_message_sender: raft_message_sender.into_sink(),
         };
 
-        let peer_nodes = peer_node_configs
-            .into_iter()
-            .map(|config| {
-                (
-                    config.id,
-                    PeerNode {
-                        id: config.id,
-                        grpc_client: RaftClient::new(config.channel),
-                        mailbox: config.mailbox.into_stream(),
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-
         Self {
             grpc_listen_addr: listen_addr,
             local_node: Some(local_node),
-            peer_nodes,
+            peer_nodes: Default::default(),
+            rpc_raft_node_change_event_receiver,
         }
     }
 
@@ -176,32 +160,83 @@ impl Rpc {
             .map(|(peer_node_id, peer_node)| (*peer_node_id, peer_node.mailbox.clone()))
             .map(|(peer_node_id, peer_node_mailbox)| {
                 peer_node_mailbox.map(move |message| (peer_node_id, message))
-            })
-            .collect::<Vec<_>>();
+            });
 
-        let mut peer_node_mailboxes = stream::select_all(peer_node_mailboxes);
+        let peer_node_mailboxes = stream::select_all(peer_node_mailboxes);
 
-        while let Some((peer_node_id, message)) = peer_node_mailboxes.next().await {
-            match self.peer_nodes.get(&peer_node_id) {
-                None => {
-                    warn!(peer_node_id, "raft message target node not exist");
+        let mut either_stream = select_either(
+            peer_node_mailboxes,
+            self.rpc_raft_node_change_event_receiver
+                .clone()
+                .into_stream(),
+        );
 
-                    continue;
-                }
+        while let Some(either) = either_stream.next().await {
+            match either {
+                Either::Left((peer_node_id, message)) => match self.peer_nodes.get(&peer_node_id) {
+                    None => {
+                        warn!(peer_node_id, "raft message target node not exist");
+                    }
 
-                Some(peer_node) => {
-                    peer_node.send_message_background(message);
+                    Some(peer_node) => {
+                        peer_node.send_message_background(message);
 
-                    info!(peer_node_id, "send message to peer node in background");
+                        info!(peer_node_id, "send message to peer node in background");
+                    }
+                },
+
+                Either::Right(change_event) => {
+                    self.handle_node_change_event(change_event).await?;
+
+                    info!("handle node change event done");
                 }
             }
         }
 
-        error!("get raft message from peer node mailboxes stopped unexpected");
+        Err(anyhow::anyhow!("run_peer_nodes stop unexpected"))
+    }
 
-        Err(anyhow::anyhow!(
-            "get raft message from peer node mailboxes stopped unexpected"
-        ))
+    #[instrument(skip(self), err)]
+    async fn handle_node_change_event(&mut self, event: RpcRaftNodeEvent) -> anyhow::Result<()> {
+        info!(?event, "handle node change event");
+
+        match event {
+            RpcRaftNodeEvent::Add {
+                node_id,
+                uri,
+                mut mailbox_sender_provider,
+            } => {
+                let channel = Channel::builder(uri.clone())
+                    .connect_with_connector_lazy(Connector::default())
+                    .tap_err(|err| error!(?err, node_id, %uri, "connect to new node failed"))?;
+
+                let (mailbox_sender, mailbox) = flume::unbounded();
+
+                self.peer_nodes.insert(
+                    node_id,
+                    PeerNode {
+                        id: node_id,
+                        grpc_client: RaftClient::new(channel),
+                        mailbox: mailbox.into_stream(),
+                    },
+                );
+
+                mailbox_sender_provider
+                    .send(mailbox_sender)
+                    .await
+                    .tap_err(|err| error!(?err, "provide mailbox sender failed"))?;
+
+                info!(node_id, %uri, "add new peer node done");
+            }
+
+            RpcRaftNodeEvent::Remove { node_id } => {
+                self.peer_nodes.remove(&node_id);
+
+                info!(node_id, "remove peer node done");
+            }
+        }
+
+        Ok(())
     }
 }
 

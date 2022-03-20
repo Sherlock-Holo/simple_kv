@@ -2,11 +2,6 @@ node_id: 1
 local_kv_listen_addr: 0.0.0.0:7661
 local_raft_listen_addr: 0.0.0.0:7662
 data: /srv/simple_kv/data
-peers:
-  - node_id: 2
-    node_raft_url: http://node2:7662
-
-  - node_id: 3
-    node_raft_url: http://node3:7662
+registry_uri: http://registry:7663
 
 debug_log: false

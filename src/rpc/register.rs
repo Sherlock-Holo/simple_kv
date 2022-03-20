@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -31,6 +32,22 @@ pub enum NodeChangeEvent {
     },
 }
 
+impl Debug for NodeChangeEvent {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeChangeEvent::Add { node_id, .. } => f
+                .debug_struct("NodeChangeEvent::Add")
+                .field("node_id", node_id)
+                .finish(),
+
+            NodeChangeEvent::Remove { node_id } => f
+                .debug_struct("NodeChangeEvent::Remove")
+                .field("node_id", node_id)
+                .finish(),
+        }
+    }
+}
+
 pub enum RpcRaftNodeEvent {
     Add {
         node_id: u64,
@@ -44,6 +61,23 @@ pub enum RpcRaftNodeEvent {
     },
 }
 
+impl Debug for RpcRaftNodeEvent {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcRaftNodeEvent::Add { node_id, uri, .. } => f
+                .debug_struct("RpcRaftNodeEvent::Add")
+                .field("node_id", node_id)
+                .field("uri", uri)
+                .finish(),
+
+            RpcRaftNodeEvent::Remove { node_id } => f
+                .debug_struct("RpcRaftNodeEvent::Remove")
+                .field("node_id", node_id)
+                .finish(),
+        }
+    }
+}
+
 pub struct Register {
     registry_client: RegisterClient<Channel>,
 
@@ -54,7 +88,7 @@ pub struct Register {
     /// current nodes doesn't include self
     current_nodes: HashMap<u64, PeerNode>,
     rpc_raft_node_change_event_sender: SendSink<'static, RpcRaftNodeEvent>,
-    node_list_change_event_sender: SendSink<'static, NodeChangeEvent>,
+    node_change_event_sender: SendSink<'static, NodeChangeEvent>,
 }
 
 impl Register {
@@ -64,7 +98,7 @@ impl Register {
         node_uri: Uri,
         period: Duration,
         rpc_raft_node_change_event_sender: SendSink<'static, RpcRaftNodeEvent>,
-        node_list_change_event_sender: SendSink<'static, NodeChangeEvent>,
+        node_change_event_sender: SendSink<'static, NodeChangeEvent>,
     ) -> Self {
         Self {
             registry_client: RegisterClient::new(channel),
@@ -73,7 +107,7 @@ impl Register {
             period,
             current_nodes: Default::default(),
             rpc_raft_node_change_event_sender,
-            node_list_change_event_sender,
+            node_change_event_sender,
         }
     }
 
@@ -191,7 +225,8 @@ impl Register {
             let mut removed = stream::iter(
                 removed
                     .iter()
-                    .map(|node_id| RpcRaftNodeEvent::Remove { node_id: *node_id })
+                    .copied()
+                    .map(|node_id| RpcRaftNodeEvent::Remove { node_id })
                     .map(Ok),
             );
 
@@ -210,7 +245,7 @@ impl Register {
                 .map(Ok),
         );
 
-        self.node_list_change_event_sender
+        self.node_change_event_sender
             .send_all(&mut removed)
             .await
             .tap_err(|err| error!(?err, "send removed node id to node failed"))?;
@@ -233,15 +268,16 @@ impl Register {
         {
             let mut add = stream::iter(
                 add.iter()
+                    .copied()
                     .map(|node_id| {
-                        let uri = self.current_nodes[node_id].uri.clone();
+                        let uri = self.current_nodes[&node_id].uri.clone();
 
                         let (mailbox_sender_provider, mailbox_sender_collector) = flume::bounded(1);
 
                         mailbox_sender_collectors.push(mailbox_sender_collector);
 
                         RpcRaftNodeEvent::Add {
-                            node_id: *node_id,
+                            node_id,
                             uri,
                             mailbox_sender_provider: mailbox_sender_provider.into_sink(),
                         }
@@ -281,7 +317,7 @@ impl Register {
                 .map(Ok),
         );
 
-        self.node_list_change_event_sender
+        self.node_change_event_sender
             .send_all(&mut add)
             .await
             .tap_err(|err| error!(?err, "send add node id and uri to node failed"))?;

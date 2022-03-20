@@ -5,11 +5,13 @@ use flume::{Receiver, RecvError, Selector};
 use raft::eraftpb;
 
 use crate::reply::{GetRequestReply, ProposalRequestReply};
+use crate::rpc::register::NodeChangeEvent;
 
 pub enum ReceiveMessage {
     Raft(Result<eraftpb::Message, RecvError>),
     GetRequest(Result<GetRequestReply, RecvError>),
     ProposalRequest(Result<ProposalRequestReply, RecvError>),
+    NodeChangeEvent(Result<NodeChangeEvent, RecvError>),
 }
 
 impl ReceiveMessage {
@@ -19,10 +21,12 @@ impl ReceiveMessage {
         Vec<eraftpb::Message>,
         Vec<GetRequestReply>,
         Option<ProposalRequestReply>,
+        Vec<NodeChangeEvent>,
     ) {
         let mut raft_messages = vec![];
         let mut get_request_reply_messages = vec![];
         let mut proposal_request_reply = None;
+        let mut node_change_events = vec![];
 
         for message in all_messages {
             match message {
@@ -31,6 +35,7 @@ impl ReceiveMessage {
                 ReceiveMessage::ProposalRequest(Ok(msg)) => {
                     proposal_request_reply.replace(msg);
                 }
+                ReceiveMessage::NodeChangeEvent(Ok(msg)) => node_change_events.push(msg),
 
                 _ => {}
             }
@@ -40,6 +45,7 @@ impl ReceiveMessage {
             raft_messages,
             get_request_reply_messages,
             proposal_request_reply,
+            node_change_events,
         )
     }
 }
@@ -48,6 +54,7 @@ pub struct ContinueSelector<'a> {
     raft_message_receiver: &'a Receiver<eraftpb::Message>,
     get_request_receiver: &'a Receiver<GetRequestReply>,
     proposal_request_receiver: &'a Receiver<ProposalRequestReply>,
+    node_change_event_receiver: &'a Receiver<NodeChangeEvent>,
 }
 
 impl<'a> ContinueSelector<'a> {
@@ -55,11 +62,13 @@ impl<'a> ContinueSelector<'a> {
         raft_message_receiver: &'a Receiver<eraftpb::Message>,
         get_request_receiver: &'a Receiver<GetRequestReply>,
         proposal_request_receiver: &'a Receiver<ProposalRequestReply>,
+        node_change_event_receiver: &'a Receiver<NodeChangeEvent>,
     ) -> Self {
         Self {
             raft_message_receiver,
             get_request_receiver,
             proposal_request_receiver,
+            node_change_event_receiver,
         }
     }
 
@@ -71,7 +80,11 @@ impl<'a> ContinueSelector<'a> {
         loop {
             let mut selector = Selector::new()
                 .recv(self.raft_message_receiver, ReceiveMessage::Raft)
-                .recv(self.get_request_receiver, ReceiveMessage::GetRequest);
+                .recv(self.get_request_receiver, ReceiveMessage::GetRequest)
+                .recv(
+                    self.node_change_event_receiver,
+                    ReceiveMessage::NodeChangeEvent,
+                );
 
             if !has_proposal_request {
                 selector = selector.recv(

@@ -41,6 +41,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 serde_yaml = "0.8"
 clap = { version = "3", features = ["derive", "color", "suggestions"] }
 rayon = "1"
+pin-project = "1"
 
 [build-dependencies]
 tonic-build = "0.6"
