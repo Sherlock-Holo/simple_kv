@@ -121,6 +121,7 @@ impl<KV, ST> NodeBuilder<KV, ST>
 where
     KV: KeyValueBackend,
     ST: Storage + LogBackend,
+    ST::Error: Send + Sync + 'static,
 {
     pub fn build(mut self) -> anyhow::Result<Node<KV, ST>> {
         use anyhow::anyhow;
@@ -132,10 +133,16 @@ where
 
         let tick_interval = self.tick_interval;
 
-        let storage = self
+        let mut storage = self
             .storage
             .take()
             .with_context(|| anyhow!("storage is not set"))?;
+
+        storage.apply_config_state(ConfigState {
+            voters: vec![config.id],
+            ..Default::default()
+        })?;
+
         let kv = self.kv.take().with_context(|| anyhow!("kv is not set"))?;
 
         let mailbox = self
@@ -237,6 +244,7 @@ where
         }
     }
 
+    #[instrument(skip(self), err)]
     fn wait_other_nodes_online(&mut self) -> anyhow::Result<()> {
         // only odd node cluster can run normal
         while self.other_node_mailboxes.is_empty() || self.other_node_mailboxes.len() % 2 != 0 {
@@ -264,6 +272,15 @@ where
             info!("add nodes done");
         }
 
+        self.init_config_state()?;
+
+        info!("init config state done");
+
+        Ok(())
+    }
+
+    #[instrument(skip(self), err)]
+    fn init_config_state(&mut self) -> anyhow::Result<()> {
         let mut nodes = self
             .other_node_mailboxes
             .keys()
@@ -273,12 +290,30 @@ where
 
         info!(?nodes, "get all node ids");
 
-        let config_state = ConfigState {
-            voters: nodes,
+        let changes = self
+            .other_node_mailboxes
+            .keys()
+            .copied()
+            .map(|node_id| eraftpb::ConfChangeSingle {
+                change_type: eraftpb::ConfChangeType::AddNode as _,
+                node_id,
+            })
+            .collect::<Vec<_>>();
+
+        let conf_change_v2 = eraftpb::ConfChangeV2 {
+            transition: eraftpb::ConfChangeTransition::Auto as _,
+            changes,
             ..Default::default()
         };
 
-        self.raw_node.mut_store().apply_config_state(config_state)?;
+        let conf_state = self
+            .raw_node
+            .apply_conf_change(&conf_change_v2)
+            .tap_err(|err| error!(?err, "apply init config change failed"))?;
+
+        self.raw_node
+            .mut_store()
+            .apply_config_state(conf_state.into())?;
 
         info!("apply config state done");
 
@@ -305,6 +340,14 @@ where
             error!(node_id, "proposal request queue is disconnected");
 
             return Err(anyhow::anyhow!("proposal request queue is disconnected"));
+        }
+
+        if self.node_change_event_receiver.is_disconnected() {
+            error!(node_id, "node change event receiver is disconnected");
+
+            return Err(anyhow::anyhow!(
+                "node change event receiver is disconnected"
+            ));
         }
 
         match self.receive_all_messages() {
@@ -513,6 +556,7 @@ where
     fn handle_node_change_events(&mut self, events: Vec<NodeChangeEvent>) -> anyhow::Result<()> {
         let mut config_change = eraftpb::ConfChangeV2 {
             transition: eraftpb::ConfChangeTransition::Auto as _,
+            changes: Vec::with_capacity(events.len()),
             ..Default::default()
         };
 
@@ -564,7 +608,7 @@ where
     fn handle_proposal_requests(
         &mut self,
         node_id: u64,
-        mut leader_id: u64,
+        leader_id: u64,
         reply: Option<ProposalRequestReply>,
     ) -> anyhow::Result<()> {
         if self.is_leader() {
@@ -581,12 +625,6 @@ where
             }
 
             return Ok(());
-        }
-
-        // when leader_id = 0, means no leader is elected
-        if leader_id == 0 {
-            // set leader_id to node_id to make sure client retry
-            leader_id = node_id;
         }
 
         // follower node can't handle proposal request
@@ -812,7 +850,7 @@ mod tests {
     use crate::storage::log::LogBackend as _;
 
     #[test]
-    fn full_test() {
+    fn connected_test() {
         // crate::init_log(true);
 
         let tmp_dir1 = TempDir::new_in(env::temp_dir()).unwrap();
@@ -962,7 +1000,9 @@ mod tests {
                 Err(RequestError::NotLeader(new_leader)) => {
                     dbg!(new_leader);
 
-                    leader_id = new_leader;
+                    if new_leader != 0 {
+                        leader_id = new_leader;
+                    }
 
                     thread::sleep(Duration::from_millis(100));
 
@@ -1001,6 +1041,236 @@ mod tests {
 
                 Ok(value) => {
                     println!("{}", String::from_utf8_lossy(&value.unwrap()));
+
+                    break;
+                }
+
+                Err(err) => panic!("{}", err),
+            }
+        }
+
+        stop_signal.store(true, Ordering::Release);
+
+        for join_handle in join_handles {
+            let _ = join_handle.join();
+        }
+    }
+
+    #[test]
+    fn node_init_with_register_test() {
+        // crate::init_log(true);
+
+        let tmp_dir1 = TempDir::new_in(env::temp_dir()).unwrap();
+        let log_path1 = tmp_dir1.path().join("log1");
+        let kv_path1 = tmp_dir1.path().join("kv1");
+
+        let tmp_dir2 = TempDir::new_in(env::temp_dir()).unwrap();
+        let log_path2 = tmp_dir2.path().join("log2");
+        let kv_path2 = tmp_dir2.path().join("kv2");
+
+        let tmp_dir3 = TempDir::new_in(env::temp_dir()).unwrap();
+        let log_path3 = tmp_dir3.path().join("log3");
+        let kv_path3 = tmp_dir3.path().join("kv3");
+
+        let kv_backend1 = KvBackend::create(&kv_path1).unwrap();
+
+        let log_backend1 = LogBackend::create(&log_path1, kv_backend1.clone()).unwrap();
+
+        let kv_backend2 = KvBackend::create(&kv_path2).unwrap();
+
+        let log_backend2 = LogBackend::create(&log_path2, kv_backend2.clone()).unwrap();
+
+        let kv_backend3 = KvBackend::create(&kv_path3).unwrap();
+
+        let log_backend3 = LogBackend::create(&log_path3, kv_backend3.clone()).unwrap();
+
+        let mut backends = HashMap::from([
+            (1, (log_backend1, kv_backend1)),
+            (2, (log_backend2, kv_backend2)),
+            (3, (log_backend3, kv_backend3)),
+        ]);
+
+        let mut mailbox_senders = HashMap::new();
+        let mut mailboxes = HashMap::new();
+        let mut proposal_request_senders = HashMap::new();
+        let mut proposal_request_queues = HashMap::new();
+        let mut get_request_senders = HashMap::new();
+        let mut get_request_queues = HashMap::new();
+        let mut node_change_event_senders = HashMap::new();
+        let mut node_change_event_receivers = HashMap::new();
+
+        for node_id in 1..=3 {
+            let (mailbox_sender, mailbox) = flume::unbounded();
+
+            mailbox_senders.insert(node_id, mailbox_sender);
+            mailboxes.insert(node_id, mailbox);
+
+            let (proposal_request_sender, proposal_request_queue) = flume::unbounded();
+            proposal_request_senders.insert(node_id, proposal_request_sender);
+            proposal_request_queues.insert(node_id, proposal_request_queue);
+
+            let (get_request_sender, get_request_queue) = flume::unbounded();
+            get_request_senders.insert(node_id, get_request_sender);
+            get_request_queues.insert(node_id, get_request_queue);
+
+            let (node_change_event_sender, node_change_event_receiver) = flume::unbounded();
+            node_change_event_senders.insert(node_id, node_change_event_sender);
+            node_change_event_receivers.insert(node_id, node_change_event_receiver);
+        }
+
+        let stop_signal = Arc::new(AtomicBool::new(false));
+
+        let mut nodes = vec![];
+        for node_id in 1..=3 {
+            let mut builder = NodeBuilder::default();
+
+            let (log_backend, kv_backend) = backends.remove(&node_id).unwrap();
+            let mailbox = mailboxes.remove(&node_id).unwrap();
+
+            let proposal_request_queue = proposal_request_queues.remove(&node_id).unwrap();
+            let get_request_queue = get_request_queues.remove(&node_id).unwrap();
+            let node_change_event_receiver = node_change_event_receivers.remove(&node_id).unwrap();
+
+            builder
+                .config(Config::new(node_id))
+                .storage(log_backend)
+                .kv(kv_backend)
+                .mailbox(mailbox)
+                .proposal_request_queue(proposal_request_queue)
+                .get_request_queue(get_request_queue)
+                .node_change_event_receiver(node_change_event_receiver)
+                .stop_signal(stop_signal.clone());
+
+            let node = builder.build().unwrap();
+
+            nodes.push(node);
+        }
+
+        for node_id in 1..=3 {
+            let node_change_event_sender = node_change_event_senders.remove(&node_id).unwrap();
+
+            let node_change_events = if node_id == 1 {
+                let mailbox2 = mailbox_senders.get(&2).unwrap().clone();
+                let mailbox3 = mailbox_senders.get(&3).unwrap().clone();
+
+                [
+                    NodeChangeEvent::Add {
+                        node_id: 2,
+                        mailbox_sender: Some(mailbox2),
+                    },
+                    NodeChangeEvent::Add {
+                        node_id: 3,
+                        mailbox_sender: Some(mailbox3),
+                    },
+                ]
+            } else if node_id == 2 {
+                let mailbox1 = mailbox_senders.get(&1).unwrap().clone();
+                let mailbox3 = mailbox_senders.get(&3).unwrap().clone();
+
+                [
+                    NodeChangeEvent::Add {
+                        node_id: 1,
+                        mailbox_sender: Some(mailbox1),
+                    },
+                    NodeChangeEvent::Add {
+                        node_id: 3,
+                        mailbox_sender: Some(mailbox3),
+                    },
+                ]
+            } else {
+                let mailbox1 = mailbox_senders.get(&1).unwrap().clone();
+                let mailbox2 = mailbox_senders.get(&2).unwrap().clone();
+
+                [
+                    NodeChangeEvent::Add {
+                        node_id: 1,
+                        mailbox_sender: Some(mailbox1),
+                    },
+                    NodeChangeEvent::Add {
+                        node_id: 2,
+                        mailbox_sender: Some(mailbox2),
+                    },
+                ]
+            };
+
+            for node_change_event in node_change_events {
+                node_change_event_sender.send(node_change_event).unwrap();
+            }
+
+            // to avoid node change event receiver disconnected
+            mem::forget(node_change_event_sender);
+        }
+
+        let join_handles = nodes
+            .into_iter()
+            .map(|mut node| {
+                thread::spawn(move || {
+                    node.run()
+                        .tap_err(|err| error!(%err, "node stop with error"))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut leader_id = 1;
+
+        loop {
+            dbg!(leader_id);
+
+            let sender = proposal_request_senders.get_mut(&leader_id).unwrap();
+
+            let (reply, result_receiver) = ProposalRequestReply::new(KeyValueOperation::new(
+                Operation::InsertOrUpdate,
+                b"test1".as_slice(),
+                b"test1".as_slice(),
+            ));
+
+            sender.send(reply).unwrap();
+
+            match result_receiver.recv().unwrap() {
+                Err(RequestError::NotLeader(new_leader)) => {
+                    dbg!(new_leader);
+
+                    if new_leader != 0 {
+                        leader_id = new_leader;
+                    }
+
+                    thread::sleep(Duration::from_millis(100));
+
+                    continue;
+                }
+
+                Ok(_) => {
+                    dbg!("proposal request done");
+
+                    break;
+                }
+
+                Err(err) => panic!("{}", err),
+            }
+        }
+
+        loop {
+            dbg!(leader_id);
+
+            let sender = get_request_senders.get_mut(&leader_id).unwrap();
+
+            let (reply, result_receiver) = GetRequestReply::new(b"test1".as_slice());
+
+            sender.send(reply).unwrap();
+
+            match result_receiver.recv().unwrap() {
+                Err(RequestError::NotLeader(new_leader)) => {
+                    dbg!(new_leader);
+
+                    leader_id = new_leader;
+
+                    thread::sleep(Duration::from_millis(100));
+
+                    continue;
+                }
+
+                Ok(value) => {
+                    dbg!(String::from_utf8_lossy(&value.unwrap()));
 
                     break;
                 }

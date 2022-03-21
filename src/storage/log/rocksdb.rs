@@ -17,7 +17,6 @@ type DataEncoding =
     WithOtherIntEncoding<WithOtherEndian<DefaultOptions, BigEndian>, VarintEncoding>;
 
 const HARD_STATE_PATH: &str = "kv_core/state/hard_state";
-const CONFIG_STATE_PATH: &str = "kv_core/state/config_state";
 const ENTRIES_COLUMN_FAMILY: &str = "kv_core_entries";
 const ENTRIES_PATH_PREFIX: &str = "kv_core/entries/";
 const SNAPSHOT_METADATA_PATH: &str = "kv_core/snapshot/metadata";
@@ -40,6 +39,7 @@ pub struct RocksdbBackend<KV> {
     db: DB,
     kv_backend: KV,
     data_encoding: DataEncoding,
+    config_state: Option<ConfigState>,
 }
 
 impl<KV> RocksdbBackend<KV>
@@ -67,6 +67,7 @@ where
             db,
             kv_backend,
             data_encoding,
+            config_state: None,
         })
     }
 
@@ -121,6 +122,7 @@ where
             db,
             kv_backend,
             data_encoding,
+            config_state: None,
         })
     }
 
@@ -159,47 +161,6 @@ where
                 batch.put(HARD_STATE_PATH, hard_state_data);
 
                 info!(?hard_state, "insert hard state to write batch done");
-
-                Ok(())
-            }
-        }
-    }
-
-    #[instrument(skip(self, batch, encode_buf), err)]
-    fn apply_config_state_with_batch(
-        &mut self,
-        config_state: &ConfigState,
-        batch: Option<&mut WriteBatch>,
-        encode_buf: &mut BytesMut,
-    ) -> Result<(), Error> {
-        let mut encode_buf = encode_buf.writer();
-
-        self.data_encoding
-            .serialize_into(&mut encode_buf, config_state)
-            .map_err(|err| {
-                error!(%err, ?config_state, "serialize config state failed");
-
-                Error::Store(StorageError::Other(err))
-            })?;
-
-        info!(?config_state, "serialize config state done");
-
-        let config_state_data = encode_buf.get_mut().split();
-
-        match batch {
-            None => self
-                .db
-                .put(CONFIG_STATE_PATH, config_state_data)
-                .map_err(|err| {
-                    error!(%err, ?config_state, "insert config state failed");
-
-                    Error::Io(io::Error::new(ErrorKind::Other, err))
-                }),
-
-            Some(batch) => {
-                batch.put(CONFIG_STATE_PATH, config_state_data);
-
-                info!(?config_state, "insert config state to write batch done");
 
                 Ok(())
             }
@@ -389,39 +350,17 @@ where
 
     #[instrument(skip(self), err)]
     fn config_state(&self) -> Result<ConfigState, Error> {
-        let config_state = self.db.get_pinned(CONFIG_STATE_PATH).map_err(|err| {
-            error!(%err, "get config state failed");
-
-            Error::Store(StorageError::Other(err.into()))
-        })?;
-
-        let config_state = match config_state {
+        match self.config_state.clone() {
             None => {
                 error!("rocksdb has no config state");
 
-                return Err(Error::ConfigInvalid(
+                Err(Error::ConfigInvalid(
                     "rocksdb has no config state".to_string(),
-                ));
+                ))
             }
 
-            Some(hard_state) => {
-                let config_state: ConfigState =
-                    self.data_encoding.deserialize(&hard_state).map_err(|err| {
-                        error!(%err, "deserialize config state data failed");
-
-                        Error::ConfigInvalid(format!(
-                            "deserialize config state data failed: {}",
-                            err
-                        ))
-                    })?;
-
-                info!(?config_state, "deserialize config state done");
-
-                config_state
-            }
-        };
-
-        Ok(config_state)
+            Some(config_state) => Ok(config_state),
+        }
     }
 }
 
@@ -551,7 +490,9 @@ where
 
     #[instrument(skip(self), err)]
     fn apply_config_state(&mut self, config_state: ConfigState) -> Result<(), Self::Error> {
-        self.apply_config_state_with_batch(&config_state, None, &mut BytesMut::new())
+        self.config_state.replace(config_state.clone());
+
+        Ok(())
     }
 
     #[instrument(skip(self), err)]
@@ -632,9 +573,7 @@ where
         debug!(new_hard_state = ?hard_state, "insert new hard state to write batch done");
 
         if let Some(config_state) = &snapshot_metadata.config_state {
-            self.apply_config_state_with_batch(config_state, Some(&mut write_batch), &mut buf)?;
-
-            debug!(new_config_state = ?config_state, "insert new config state to write batch done");
+            self.config_state.replace(config_state.clone());
         }
 
         let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
