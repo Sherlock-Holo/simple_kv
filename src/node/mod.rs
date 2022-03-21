@@ -238,7 +238,8 @@ where
     }
 
     fn wait_other_nodes_online(&mut self) -> anyhow::Result<()> {
-        while self.other_node_mailboxes.is_empty() {
+        // only odd node cluster can run normal
+        while self.other_node_mailboxes.is_empty() || self.other_node_mailboxes.len() % 2 != 0 {
             let first_event = match self.node_change_event_receiver.recv() {
                 Err(_) => {
                     error!("node change event receiver closed");
