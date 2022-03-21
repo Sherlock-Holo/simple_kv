@@ -394,11 +394,16 @@ where
 
     #[instrument(skip(self))]
     fn receive_all_messages(&mut self) -> Result<Vec<ReceiveMessage>, SelectError> {
+        // when no leader elected, don't receive the node change event, or the new nodes can't join
+        // the cluster
+        let node_change_event_receiver =
+            (self.raw_node.raft.leader_id != 0).then(|| &self.node_change_event_receiver);
+
         ContinueSelector::new(
             &self.mailbox,
             &self.get_request_queue,
             &self.proposal_request_queue,
-            &self.node_change_event_receiver,
+            node_change_event_receiver,
         )
         .wait_timeout(self.tick_interval)
     }
