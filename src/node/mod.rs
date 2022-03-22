@@ -16,6 +16,7 @@ use protobuf::error::WireError;
 use protobuf::ProtobufError;
 use raft::{eraftpb, Config, RawNode, StateRole, Storage};
 use rayon::prelude::*;
+use slog::Logger;
 use tap::TapFallible;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -165,7 +166,7 @@ where
             .take()
             .with_context(|| anyhow!("node_change_event_receiver is not set"))?;
 
-        let raw_node = RawNode::with_default_logger(&config, storage)
+        let raw_node = RawNode::new(&config, storage, &Logger::root(slog::Discard, slog::o!()))
             .tap_err(|err| error!(%err, "init raw node failed"))?;
 
         info!("init raw node done");
