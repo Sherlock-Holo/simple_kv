@@ -43,6 +43,8 @@ clap = { version = "3", features = ["derive", "color", "suggestions"] }
 rayon = "1"
 pin-project = "1"
 slog = "2"
+rand = "0.8"
+dashmap = "5"
 
 [build-dependencies]
 tonic-build = "0.6"

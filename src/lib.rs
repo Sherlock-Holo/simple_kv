@@ -28,7 +28,6 @@ mod node;
 mod reply;
 mod rpc;
 mod storage;
-mod stream_ext;
 mod tokio_ext;
 
 fn init_log(debug_log: bool) {
@@ -69,7 +68,12 @@ pub async fn run() -> anyhow::Result<()> {
         rpc_raft_node_change_event_receiver,
     );
 
+    let raft_rpc_task = tokio::spawn(async move { raft_rpc.run().await }).flatten_result();
+
     let kv_rpc = KvRpc::new(proposal_request_sender, get_request_sender);
+
+    let kv_rpc_task =
+        tokio::spawn(async move { kv_rpc.run(config.local_kv_listen_addr).await }).flatten_result();
 
     info!("create raft rpc and kv rpc done");
 
@@ -82,10 +86,12 @@ pub async fn run() -> anyhow::Result<()> {
         registry_channel,
         config.node_id,
         config.node_uri.parse().unwrap(),
-        Duration::from_secs(30),
+        Duration::from_secs(10),
         rpc_raft_node_change_event_sender.into_sink(),
         node_change_event_sender.into_sink(),
     );
+
+    let register_task = tokio::spawn(async move { register.run().await }).flatten_result();
 
     let mut builder = NodeBuilder::default();
     builder
@@ -97,18 +103,14 @@ pub async fn run() -> anyhow::Result<()> {
         .get_request_queue(get_request_queue)
         .node_change_event_receiver(node_change_event_receiver);
 
-    let mut node = builder.build()?;
+    let node_task = task::spawn_blocking(move || {
+        let mut node = builder.build()?;
 
-    info!("create raft node done");
+        info!("create raft node done");
 
-    let raft_rpc_task = tokio::spawn(async move { raft_rpc.run().await }).flatten_result();
-
-    let kv_rpc_task =
-        tokio::spawn(async move { kv_rpc.run(config.local_kv_listen_addr).await }).flatten_result();
-
-    let register_task = tokio::spawn(async move { register.run().await }).flatten_result();
-
-    let node_task = task::spawn_blocking(move || node.run()).flatten_result();
+        node.run()
+    })
+    .flatten_result();
 
     if let Err(err) = try_join!(raft_rpc_task, kv_rpc_task, node_task, register_task) {
         error!(%err, "tasks stop with error");

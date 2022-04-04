@@ -1,6 +1,7 @@
 node_id: 1
 local_kv_listen_addr: 0.0.0.0:7661
 local_raft_listen_addr: 0.0.0.0:7662
+node_uri: http://127.0.0.1:7662
 data: /srv/simple_kv/data
 registry_uri: http://registry:7663
 

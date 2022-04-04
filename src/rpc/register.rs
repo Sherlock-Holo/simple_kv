@@ -121,7 +121,7 @@ impl Register {
 
             debug!("update node list done");
 
-            time::sleep(self.period / 2).await;
+            time::sleep(self.period).await;
         }
     }
 
@@ -129,7 +129,6 @@ impl Register {
     async fn register_self(&mut self) -> anyhow::Result<()> {
         let request = RegisterNodeRequest {
             node_id: self.node_id,
-            period: self.period.as_millis() as _,
             node_uri: self.node_uri.to_string(),
         };
 
@@ -290,7 +289,7 @@ impl Register {
                 .await
                 .tap_err(|err| error!(?err, "send add node id and uri to rpc raft failed"))?;
 
-            info!("send add node id and uri to rpc raft done");
+            info!("send add node ids and uris to rpc raft done");
         }
 
         let mailbox_senders = stream::iter(mailbox_sender_collectors)
@@ -316,6 +315,8 @@ impl Register {
                 })
                 .map(Ok),
         );
+
+        info!("send add node ids and mailbox senders to raft node done");
 
         self.node_change_event_sender
             .send_all(&mut add)

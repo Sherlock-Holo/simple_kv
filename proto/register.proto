@@ -4,12 +4,10 @@ package skv_register;
 
 message RegisterNodeRequest {
   uint64 node_id = 1;
-  uint64 period = 2; // time unit is millisecond
   string node_uri = 3;
 }
 
 message RegisterNodeResponse {
-  uint64 period = 1; // time unit is millisecond
 }
 
 message ListNodesRequest {
@@ -25,8 +23,17 @@ message ListNodesResponse {
   repeated NodeInfo node_list = 1;
 }
 
+message LeaveNodeRequest {
+  uint64 node_id = 1;
+}
+
+message LeaveNodeResponse {
+}
+
 service Register {
   rpc register_node(RegisterNodeRequest) returns (RegisterNodeResponse) {}
 
   rpc list_nodes(ListNodesRequest) returns (ListNodesResponse) {}
+
+  rpc leave_node(LeaveNodeRequest) returns (LeaveNodeResponse) {}
 }

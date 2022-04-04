@@ -11,7 +11,9 @@ use tap::TapFallible;
 use tracing::{debug, error, info, instrument};
 
 use crate::storage::key_value::{KeyValueBackend, KeyValuePair};
-use crate::storage::log::{ConfigState, Entry, HardState, LogBackend, Snapshot, SnapshotMetadata};
+use crate::storage::log::{
+    ConfigState, Entry, EntryType, HardState, LogBackend, Snapshot, SnapshotMetadata,
+};
 
 type DataEncoding =
     WithOtherIntEncoding<WithOtherEndian<DefaultOptions, BigEndian>, VarintEncoding>;
@@ -109,21 +111,32 @@ where
         db.put(SNAPSHOT_DATA_PATH, snapshot_data)
             .tap_err(|err| error!(%err, "insert empty snapshot data failed"))?;
 
+        // we have a dummy index
         let last_index = data_encoding
-            .serialize(&0u64)
+            .serialize(&1u64)
             .tap_err(|err| error!(%err, "serialize 0 last index failed"))?;
 
         db.put(LAST_INDEX_PATH, last_index)
             .tap_err(|err| error!(%err, "insert 0 last index failed"))?;
 
-        info!("init rocksdb done");
-
-        Ok(RocksdbBackend {
+        let mut backend = RocksdbBackend {
             db,
             kv_backend,
             data_encoding,
             config_state: None,
-        })
+        };
+
+        backend.append_entries(vec![Entry {
+            entry_type: EntryType::EntryNormal,
+            term: 1,
+            index: 1,
+            data: Default::default(),
+            context: Default::default(),
+        }])?;
+
+        info!("init rocksdb done");
+
+        Ok(backend)
     }
 
     #[instrument(skip(self, batch, encode_buf), err)]
@@ -207,7 +220,7 @@ where
     fn create_snapshot(&self, request_index: u64) -> Result<Snapshot, Error> {
         let hard_state = self.hard_state()?;
 
-        info!(?hard_state, "get hard state done");
+        debug!(?hard_state, "get hard state done");
 
         if request_index > hard_state.commit {
             error!(
@@ -216,22 +229,16 @@ where
                 "request index > commit index"
             );
 
-            return Err(Error::Store(StorageError::Other(
-                format!(
-                    "request index {} > commit index {}",
-                    request_index, hard_state.commit
-                )
-                .into(),
-            )));
+            return Err(Error::Store(StorageError::Unavailable));
         }
 
         let first_index = self.first_index()?;
 
-        info!(first_index, "get first index done");
+        debug!(first_index, "get first index done");
 
         let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
 
-        info!("get entry column family handle done");
+        debug!("get entry column family handle done");
 
         let mut write_batch = WriteBatch::default();
 
@@ -613,6 +620,25 @@ where
 
         debug!("insert snapshot data to write batch done");
 
+        if last_index < snapshot_index {
+            self.data_encoding
+                .serialize_into((&mut buf).writer(), &snapshot_index)
+                .map_err(|err| {
+                    error!(%err, ?snapshot_metadata, "serialize last index failed");
+
+                    Error::Store(StorageError::Other(err))
+                })?;
+
+            let last_index_data = buf.freeze();
+
+            write_batch.put(LAST_INDEX_PATH, last_index_data);
+
+            debug!(
+                last_index = snapshot_index,
+                "insert last index to write batch done"
+            );
+        }
+
         self.db.write(write_batch).map_err(|err| {
             error!(%err, "the whole apply snapshot operation failed");
 
@@ -743,12 +769,22 @@ where
     fn term(&self, idx: u64) -> raft::Result<u64> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
-        info!(?snapshot_metadata, "get snapshot metadata done");
+        debug!(?snapshot_metadata, "get snapshot metadata done");
 
         if snapshot_metadata.index == idx {
             debug!(idx, "the entry index == snapshot index");
 
             return Ok(snapshot_metadata.term);
+        }
+
+        let last_index = self.last_index()?;
+
+        debug!(last_index, "get last index done");
+
+        if idx > last_index {
+            error!(idx, last_index, "idx > last index");
+
+            return Err(Error::Store(StorageError::Unavailable));
         }
 
         let column_family_handle = self.get_column_family_handle(ENTRIES_COLUMN_FAMILY)?;
@@ -798,7 +834,7 @@ where
     fn first_index(&self) -> raft::Result<u64> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
-        info!(?snapshot_metadata, "get snapshot metadata done");
+        debug!(?snapshot_metadata, "get snapshot metadata done");
 
         // the first entry index is always snapshot index+1, because the log is continuous
         Ok(snapshot_metadata.index + 1)
@@ -835,7 +871,7 @@ where
     fn snapshot(&self, request_index: u64) -> raft::Result<eraftpb::Snapshot> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
-        info!("get snapshot metadata done");
+        debug!(?snapshot_metadata, "get snapshot metadata done");
 
         if snapshot_metadata.index == request_index {
             debug!(
@@ -965,7 +1001,7 @@ mod tests {
         let tmp_dir = TempDir::new_in(env::temp_dir()).unwrap();
         let backend = create_backend(tmp_dir.path());
 
-        assert_eq!(backend.last_index().unwrap(), 0);
+        assert_eq!(backend.last_index().unwrap(), 1);
     }
 
     #[test]
@@ -1010,14 +1046,14 @@ mod tests {
                 Entry {
                     entry_type: EntryType::EntryNormal,
                     term: 1,
-                    index: 1,
+                    index: 2,
                     data: Default::default(),
                     context: Default::default(),
                 },
                 Entry {
                     entry_type: EntryType::EntryNormal,
                     term: 1,
-                    index: 2,
+                    index: 3,
                     data: Default::default(),
                     context: Default::default(),
                 },
@@ -1037,23 +1073,23 @@ mod tests {
                 Entry {
                     entry_type: EntryType::EntryNormal,
                     term: 1,
-                    index: 1,
+                    index: 2,
                     data: Default::default(),
                     context: Default::default(),
                 },
                 Entry {
                     entry_type: EntryType::EntryNormal,
                     term: 1,
-                    index: 2,
+                    index: 3,
                     data: Default::default(),
                     context: Default::default(),
                 },
             ])
             .unwrap();
 
-        assert_eq!(backend.term(1).unwrap(), 1);
         assert_eq!(backend.term(2).unwrap(), 1);
-        assert!(backend.term(3).is_err());
+        assert_eq!(backend.term(3).unwrap(), 1);
+        assert!(backend.term(4).is_err());
     }
 
     #[test]
@@ -1068,14 +1104,14 @@ mod tests {
                 Entry {
                     entry_type: EntryType::EntryNormal,
                     term: 1,
-                    index: 1,
+                    index: 2,
                     data: Default::default(),
                     context: Default::default(),
                 },
                 Entry {
                     entry_type: EntryType::EntryNormal,
                     term: 1,
-                    index: 2,
+                    index: 3,
                     data: Default::default(),
                     context: Default::default(),
                 },
