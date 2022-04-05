@@ -9,9 +9,9 @@ build = "build.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
-tonic = "0.6"
-prost = "0.9"
-prost-types = "0.9"
+tonic = "0.7"
+prost = "0.10"
+prost-types = "0.10"
 http = "0.2"
 bytes = "1"
 anyhow = "1"
@@ -23,6 +23,6 @@ dashmap = "5"
 tap = "1"
 
 [build-dependencies]
-tonic-build = "0.6"
-prost-build = "0.9"
+tonic-build = "0.7"
+prost-build = "0.10"
 tokio = { version = "1", features = ["rt", "macros", "time"] }

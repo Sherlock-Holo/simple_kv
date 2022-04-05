@@ -195,9 +195,8 @@ impl Rpc {
                 uri,
                 mut mailbox_sender_provider,
             } => {
-                let channel = Channel::builder(uri.clone())
-                    .connect_with_connector_lazy(Connector::default())
-                    .tap_err(|err| error!(?err, node_id, %uri, "connect to new node failed"))?;
+                let channel =
+                    Channel::builder(uri.clone()).connect_with_connector_lazy(Connector::default());
 
                 let (mailbox_sender, mailbox) = flume::unbounded();
 
