@@ -5,7 +5,7 @@ use std::path::Path;
 use bincode::config::{BigEndian, VarintEncoding, WithOtherEndian, WithOtherIntEncoding};
 use bincode::{DefaultOptions, Options};
 use bytes::{BufMut, BytesMut};
-use raft::{eraftpb, Error, RaftState, Storage, StorageError};
+use raft::{eraftpb, Error, GetEntriesContext, RaftState, Storage, StorageError};
 use rocksdb::{ColumnFamily, WriteBatch, DB};
 use tap::TapFallible;
 use tracing::{debug, error, info, instrument};
@@ -684,6 +684,7 @@ where
         low: u64,
         high: u64,
         max_size: impl Into<Option<u64>>,
+        _context: GetEntriesContext,
     ) -> raft::Result<Vec<eraftpb::Entry>> {
         let last_index = self.last_index()?;
 
@@ -868,7 +869,7 @@ where
     }
 
     #[instrument(skip(self), err)]
-    fn snapshot(&self, request_index: u64) -> raft::Result<eraftpb::Snapshot> {
+    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<eraftpb::Snapshot> {
         let snapshot_metadata = self.get_snapshot_metadata()?;
 
         debug!(?snapshot_metadata, "get snapshot metadata done");
@@ -1263,7 +1264,9 @@ mod tests {
             ])
             .unwrap();
 
-        let entries = backend.entries(1, 3, None).unwrap();
+        let entries = backend
+            .entries(1, 3, None, GetEntriesContext::empty(false))
+            .unwrap();
         let entries = entries
             .into_iter()
             .map(|entry| entry.try_into())
@@ -1290,10 +1293,14 @@ mod tests {
             ]
         );
 
-        let entries = backend.entries(1, 1, None).unwrap();
+        let entries = backend
+            .entries(1, 1, None, GetEntriesContext::empty(false))
+            .unwrap();
         assert!(entries.is_empty());
 
-        let entries = backend.entries(1, 2, None).unwrap();
+        let entries = backend
+            .entries(1, 2, None, GetEntriesContext::empty(false))
+            .unwrap();
         let entries = entries
             .into_iter()
             .map(|entry| entry.try_into())
@@ -1310,7 +1317,9 @@ mod tests {
             }]
         );
 
-        let entries = backend.entries(2, 3, None).unwrap();
+        let entries = backend
+            .entries(2, 3, None, GetEntriesContext::empty(false))
+            .unwrap();
         let entries = entries
             .into_iter()
             .map(|entry| entry.try_into())
@@ -1437,7 +1446,7 @@ mod tests {
             .apply_key_value_operation(vec![kv_op1, kv_op2])
             .unwrap();
 
-        let snapshot = backend.snapshot(2).unwrap();
+        let snapshot = backend.snapshot(2, 2).unwrap();
 
         assert_eq!(
             SnapshotMetadata::from(snapshot.metadata.unwrap()),
@@ -1534,7 +1543,9 @@ mod tests {
         assert_eq!(backend.first_index().unwrap(), 3);
         assert_eq!(backend.last_index().unwrap(), 3);
 
-        let entries = backend.entries(3, 4, None).unwrap();
+        let entries = backend
+            .entries(3, 4, None, GetEntriesContext::empty(false))
+            .unwrap();
         let entries = entries
             .into_iter()
             .map(|entry| entry.try_into())

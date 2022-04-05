@@ -11,7 +11,7 @@ use bincode::{DefaultOptions, Options};
 use flume::select::SelectError;
 use flume::{Receiver, Sender};
 use message::ReceiveMessage;
-use prost07::Message as _;
+use prost::Message as _;
 use protobuf::error::WireError;
 use protobuf::ProtobufError;
 use raft::{eraftpb, Config, RawNode, StateRole, Storage};

@@ -12,7 +12,7 @@ use flume::r#async::{RecvStream, SendSink};
 use flume::{Receiver, Sender};
 use futures_util::future::Either;
 use futures_util::{future, stream, SinkExt, Stream, StreamExt};
-use prost07::Message;
+use prost::Message;
 use raft::eraftpb;
 use rand::prelude::*;
 use tap::TapFallible;
