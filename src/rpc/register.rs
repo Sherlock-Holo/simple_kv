@@ -83,6 +83,7 @@ pub struct Register {
 
     node_id: u64,
     node_uri: Uri,
+    kv_uri: Uri,
     period: Duration,
 
     /// current nodes doesn't include self
@@ -96,6 +97,7 @@ impl Register {
         channel: Channel,
         node_id: u64,
         node_uri: Uri,
+        kv_uri: Uri,
         period: Duration,
         rpc_raft_node_change_event_sender: SendSink<'static, RpcRaftNodeEvent>,
         node_change_event_sender: SendSink<'static, NodeChangeEvent>,
@@ -104,6 +106,7 @@ impl Register {
             registry_client: RegisterClient::new(channel),
             node_id,
             node_uri,
+            kv_uri,
             period,
             current_nodes: Default::default(),
             rpc_raft_node_change_event_sender,
@@ -113,13 +116,13 @@ impl Register {
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
         loop {
-            self.register_self().await?;
+            if self.register_self().await.is_ok() {
+                debug!("register self done");
+            }
 
-            debug!("register self done");
-
-            self.update_node_list().await?;
-
-            debug!("update node list done");
+            if self.update_node_list().await.is_ok() {
+                debug!("update node list done");
+            }
 
             time::sleep(self.period).await;
         }
@@ -130,6 +133,7 @@ impl Register {
         let request = RegisterNodeRequest {
             node_id: self.node_id,
             node_uri: self.node_uri.to_string(),
+            kv_uri: self.kv_uri.to_string(),
         };
 
         match time::timeout(

@@ -86,6 +86,9 @@ pub async fn run() -> anyhow::Result<()> {
         registry_channel,
         config.node_id,
         config.node_uri.parse().unwrap(),
+        format!("http://{}", config.local_kv_listen_addr)
+            .parse()
+            .unwrap(),
         Duration::from_secs(10),
         rpc_raft_node_change_event_sender.into_sink(),
         node_change_event_sender.into_sink(),
