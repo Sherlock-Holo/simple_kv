@@ -139,11 +139,6 @@ where
             .take()
             .with_context(|| anyhow!("storage is not set"))?;
 
-        storage.apply_config_state(ConfigState {
-            voters: vec![config.id],
-            ..Default::default()
-        })?;
-
         let kv = self.kv.take().with_context(|| anyhow!("kv is not set"))?;
 
         let mailbox = self
@@ -166,6 +161,20 @@ where
             .take()
             .with_context(|| anyhow!("node_change_event_receiver is not set"))?;
 
+        let other_node_mailboxes = Self::wait_other_nodes_online(&node_change_event_receiver)?;
+
+        info!(?other_node_mailboxes, "collect other node mailboxes done");
+
+        let mut voters = other_node_mailboxes.keys().copied().collect::<Vec<_>>();
+        voters.push(config.id);
+
+        storage.apply_config_state(ConfigState {
+            voters: voters.clone(),
+            ..Default::default()
+        })?;
+
+        info!(?voters, "apply config state done");
+
         let raw_node = RawNode::new(&config, storage, &Logger::root(slog::Discard, slog::o!()))
             .tap_err(|err| error!(%err, "init raw node failed"))?;
 
@@ -173,7 +182,7 @@ where
 
         Ok(Node {
             mailbox,
-            other_node_mailboxes: Default::default(),
+            other_node_mailboxes,
             raw_node,
             tick_interval,
             key_value_backend: kv,
@@ -185,6 +194,59 @@ where
             #[cfg(test)]
             stop_signal: self.stop_signal.take().unwrap(),
         })
+    }
+
+    #[instrument(err)]
+    fn wait_other_nodes_online(
+        node_change_event_receiver: &Receiver<NodeChangeEvent>,
+    ) -> anyhow::Result<HashMap<u64, Sender<eraftpb::Message>>> {
+        let mut other_node_mailboxes = HashMap::with_capacity(3);
+
+        // only odd node cluster can run normal
+        while other_node_mailboxes.is_empty() || other_node_mailboxes.len() % 2 != 0 {
+            let first_event = match node_change_event_receiver.recv() {
+                Err(_) => {
+                    error!("node change event receiver closed");
+
+                    return Err(anyhow::anyhow!("node change event receiver closed"));
+                }
+
+                Ok(event) => event,
+            };
+
+            let mut events = node_change_event_receiver
+                .try_iter()
+                .collect::<VecDeque<_>>();
+            events.push_front(first_event);
+
+            info!(?events, "receive node change event to init node done");
+
+            for event in events {
+                match event {
+                    NodeChangeEvent::Add {
+                        node_id,
+                        mut mailbox_sender,
+                    } => {
+                        other_node_mailboxes.insert(
+                            node_id,
+                            mailbox_sender.take().expect("mailbox sender is none"),
+                        );
+
+                        info!(node_id, "add node to other node mailboxes done");
+                    }
+
+                    NodeChangeEvent::Remove { node_id } => {
+                        other_node_mailboxes.remove(&node_id);
+
+                        info!(node_id, "remove node from other node mailboxes done");
+                    }
+                }
+            }
+
+            info!("add nodes done");
+        }
+
+        Ok(other_node_mailboxes)
     }
 }
 
@@ -225,10 +287,6 @@ where
     KV: KeyValueBackend + Send + Sync,
 {
     pub fn run(&mut self) -> anyhow::Result<()> {
-        self.wait_other_nodes_online()?;
-
-        info!("wait other nodes online done");
-
         info!("start node infinite running loop");
 
         let mut instant = Instant::now();
@@ -243,82 +301,6 @@ where
                 }
             }
         }
-    }
-
-    #[instrument(skip(self), err)]
-    fn wait_other_nodes_online(&mut self) -> anyhow::Result<()> {
-        // only odd node cluster can run normal
-        while self.other_node_mailboxes.is_empty() || self.other_node_mailboxes.len() % 2 != 0 {
-            let first_event = match self.node_change_event_receiver.recv() {
-                Err(_) => {
-                    error!("node change event receiver closed");
-
-                    return Err(anyhow::anyhow!("node change event receiver closed"));
-                }
-
-                Ok(event) => event,
-            };
-
-            let mut events = self
-                .node_change_event_receiver
-                .try_iter()
-                .collect::<VecDeque<_>>();
-            events.push_front(first_event);
-            let events = events.into_iter().collect();
-
-            info!("receive node change event to init node done");
-
-            self.handle_node_change_events(events)?;
-
-            info!("add nodes done");
-        }
-
-        self.init_config_state()?;
-
-        info!("init config state done");
-
-        Ok(())
-    }
-
-    #[instrument(skip(self), err)]
-    fn init_config_state(&mut self) -> anyhow::Result<()> {
-        let mut nodes = self
-            .other_node_mailboxes
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        nodes.push(self.raw_node.raft.id);
-
-        info!(?nodes, "get all node ids");
-
-        let changes = self
-            .other_node_mailboxes
-            .keys()
-            .copied()
-            .map(|node_id| eraftpb::ConfChangeSingle {
-                change_type: eraftpb::ConfChangeType::AddNode as _,
-                node_id,
-            })
-            .collect::<Vec<_>>();
-
-        let conf_change_v2 = eraftpb::ConfChangeV2 {
-            transition: eraftpb::ConfChangeTransition::Auto as _,
-            changes,
-            ..Default::default()
-        };
-
-        let conf_state = self
-            .raw_node
-            .apply_conf_change(&conf_change_v2)
-            .tap_err(|err| error!(?err, "apply init config change failed"))?;
-
-        self.raw_node
-            .mut_store()
-            .apply_config_state(conf_state.into())?;
-
-        info!("apply config state done");
-
-        Ok(())
     }
 
     #[instrument(skip(self), err)]
@@ -371,20 +353,23 @@ where
                     debug!(node_id, "node is leader");
                 }
             }
+
             Ok(all_messages) => {
                 let (raft_msgs, get_request_msgs, proposal_request_msg, node_change_events) =
                     ReceiveMessage::split(all_messages);
 
+                debug!(?raft_msgs, "receive raft message");
+
                 for msg in raft_msgs {
                     let from = msg.from;
 
-                    info!(node_id, from, "get other node message done");
+                    debug!(node_id, from, "get other node message done");
 
                     self.raw_node.step(msg).tap_err(|err| {
                         error!(node_id, %err, from, "step other node message failed");
                     })?;
 
-                    info!(node_id, from, "step other node message done");
+                    debug!(node_id, from, "step other node message done");
                 }
 
                 let elapsed = instant.elapsed();
@@ -413,11 +398,11 @@ where
 
                 self.handle_get_requests(node_id, leader_id, get_request_msgs)?;
 
-                info!("handle get requests done");
+                debug!("handle get requests done");
 
                 self.handle_proposal_requests(node_id, leader_id, proposal_request_msg)?;
 
-                info!("handle proposal requests done");
+                debug!("handle proposal requests done");
             }
         }
 
@@ -449,25 +434,25 @@ where
             &self.proposal_request_queue,
             node_change_event_receiver,
         )
-        .wait_timeout(self.tick_interval)
+        .wait_timeout(self.tick_interval / 2)
     }
 
     #[instrument(skip(self), err)]
     fn handle_ready(&mut self) -> anyhow::Result<()> {
         let mut ready = self.raw_node.ready();
 
-        self.send_message_to_other_nodes(ready.take_messages())?;
+        self.send_message_to_other_nodes(ready.take_messages());
 
-        info!("send message to other nodes done");
+        debug!("send message to other nodes done");
 
         let snapshot = ready.snapshot();
-        if snapshot.metadata.is_some() && !snapshot.data.is_empty() {
+        if *snapshot != eraftpb::Snapshot::default() {
             debug!("ready snapshot is not empty snapshot, need to apply");
 
             let snapshot = Snapshot::try_from(snapshot)
                 .tap_err(|err| error!(%err, "convert rpc snapshot to log snapshot failed"))?;
 
-            info!("convert rpc snapshot to log snapshot done");
+            debug!("convert rpc snapshot to log snapshot done");
 
             self.raw_node.mut_store().apply_snapshot(snapshot)?;
 
@@ -477,10 +462,10 @@ where
         for commit_entry in ready.take_committed_entries() {
             self.apply_commit_entry(commit_entry)?;
 
-            info!("apply commit entry done");
+            debug!("apply commit entry done");
         }
 
-        info!("apply all commit entries done");
+        debug!("apply all commit entries done");
 
         let entries = ready
             .take_entries()
@@ -489,11 +474,11 @@ where
             .collect::<Result<Vec<_>, _>>()
             .tap_err(|err| error!(%err, "convert rpc entries to log entries failed"))?;
 
-        info!("convert rcp entries to log entries done");
+        debug!(?entries, "convert rpc entries to log entries done");
 
         self.raw_node.mut_store().append_entries(entries)?;
 
-        info!("apply entries done");
+        debug!("apply entries done");
 
         if let Some(hard_state) = ready.hs() {
             self.raw_node
@@ -503,13 +488,13 @@ where
             info!(?hard_state, "apply hard state done");
         }
 
-        self.send_message_to_other_nodes(ready.take_persisted_messages())?;
+        self.send_message_to_other_nodes(ready.take_persisted_messages());
 
-        info!("send persisted messages to other nodes done");
+        debug!("send persisted messages to other nodes done");
 
         let mut light_ready = self.raw_node.advance(ready);
 
-        info!("advance ready done");
+        debug!("advance ready done");
 
         if let Some(commit_index) = light_ready.commit_index() {
             self.raw_node.mut_store().apply_commit_index(commit_index)?;
@@ -517,21 +502,21 @@ where
             info!(commit_index, "apply light ready commit index done");
         }
 
-        self.send_message_to_other_nodes(light_ready.take_messages())?;
+        self.send_message_to_other_nodes(light_ready.take_messages());
 
-        info!("send light ready message to other nodes done");
+        debug!("send light ready message to other nodes done");
 
         for commit_entry in light_ready.take_committed_entries() {
             self.apply_commit_entry(commit_entry)?;
 
-            info!("apply light ready commit entry done");
+            debug!("apply light ready commit entry done");
         }
 
-        info!("apply all light ready commit entries done");
+        debug!("apply all light ready commit entries done");
 
         self.raw_node.advance_apply();
 
-        info!("raw node advance apply done");
+        debug!("raw node advance apply done");
 
         Ok(())
     }
@@ -545,7 +530,7 @@ where
             .serialize(&key_value_operation)
             .tap_err(|err| error!(%err, "serialize key value operation failed"))?;
 
-        info!("serialize key value operation done");
+        debug!("serialize key value operation done");
 
         self.raw_node
             .propose(vec![], key_value_operation)
@@ -554,7 +539,14 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self, events), err)]
     fn handle_node_change_events(&mut self, events: Vec<NodeChangeEvent>) -> anyhow::Result<()> {
+        if events.is_empty() {
+            debug!("node change event is empty, skip it");
+
+            return Ok(());
+        }
+
         let mut config_change = eraftpb::ConfChangeV2 {
             transition: eraftpb::ConfChangeTransition::Auto as _,
             changes: Vec::with_capacity(events.len()),
@@ -620,7 +612,7 @@ where
 
                 self.propose_key_value_operation(key_value_operation)?;
 
-                info!(node_id, "propose key value operation done");
+                debug!(node_id, "propose key value operation done");
 
                 self.proposal_request_reply_queue.push_back(reply);
             }
@@ -662,32 +654,25 @@ where
         Ok(())
     }
 
-    #[instrument(skip(self, messages), err)]
-    fn send_message_to_other_nodes(
-        &mut self,
-        messages: Vec<eraftpb::Message>,
-    ) -> anyhow::Result<()> {
+    #[instrument(skip(self, messages))]
+    fn send_message_to_other_nodes(&mut self, messages: Vec<eraftpb::Message>) {
         for msg in messages {
             let to = msg.to;
 
-            debug!(to, "message start send to node");
+            debug!(node_id = to, "message start send to node");
 
             match self.other_node_mailboxes.get(&to) {
                 None => {
-                    error!(to, "node not exist");
-
-                    return Err(raft::Error::NotExists { id: to, set: "" }.into());
+                    warn!(node_id = to, "node not exist");
                 }
 
                 Some(mailbox) => {
-                    mailbox
-                        .send(msg)
-                        .tap_err(|err| error!(%err, to, "send message to node failed"))?;
+                    if mailbox.send(msg).is_err() {
+                        warn!(node_id = to, "send message to node failed");
+                    }
                 }
             }
         }
-
-        Ok(())
     }
 
     #[instrument(skip(self, commit_entry), err)]
@@ -701,11 +686,17 @@ where
         let commit_entry = Entry::try_from(commit_entry)
             .tap_err(|err| error!(%err, "convert rpc entry type to log entry failed"))?;
 
-        info!("convert rpc entry type to log entry done");
+        debug!("convert rpc entry type to log entry done");
 
         let conf_state =
             match commit_entry.entry_type {
                 EntryType::EntryNormal => {
+                    if commit_entry.index == 1 && commit_entry.term == 1 {
+                        debug!("receive dummy entry, skip it");
+
+                        return Ok(());
+                    }
+
                     let key_value_operation: KeyValueOperation = encoding()
                         .deserialize(&commit_entry.data)
                         .tap_err(|err| error!(%err, "deserialize entry data failed"))?;
@@ -713,17 +704,15 @@ where
                     self.key_value_backend
                         .apply_key_value_operation(vec![key_value_operation])?;
 
-                    info!("apply key value operation done");
+                    debug!("apply key value operation done");
 
                     // when leader apply the commit entry, means the proposal request is accepted
                     // and committed, now can reply the client
                     if self.is_leader() {
                         if let Some(reply) = self.proposal_request_reply_queue.pop_front() {
-                            debug!("a proposal request can reply now");
-
                             reply.reply();
 
-                            info!("reply proposal request done");
+                            debug!("reply proposal request done");
                         }
                     }
 
@@ -803,7 +792,7 @@ where
     fn handle_get_requests(
         &mut self,
         node_id: u64,
-        mut leader_id: u64,
+        leader_id: u64,
         get_request_messages: Vec<GetRequestReply>,
     ) -> anyhow::Result<()> {
         if self.is_leader() {
@@ -811,13 +800,8 @@ where
                 self.handle_get(reply);
             });
 
-            info!(node_id, "handle get request done");
+            debug!(node_id, "handle get request done");
         } else {
-            // // set leader_id to node_id to make sure client retry
-            if leader_id == 0 {
-                leader_id = node_id;
-            }
-
             // follower node data may not be latest, can't handle the get request
             get_request_messages.into_par_iter().for_each(|reply| {
                 warn!(
@@ -848,214 +832,6 @@ mod tests {
     use crate::storage::key_value::rocksdb::RocksdbBackend as KvBackend;
     use crate::storage::key_value::Operation;
     use crate::storage::log::rocksdb::RocksdbBackend as LogBackend;
-    use crate::storage::log::LogBackend as _;
-
-    #[test]
-    fn connected_test() {
-        // crate::init_log(true);
-
-        let tmp_dir1 = TempDir::new_in(env::temp_dir()).unwrap();
-        let log_path1 = tmp_dir1.path().join("log1");
-        let kv_path1 = tmp_dir1.path().join("kv1");
-
-        let tmp_dir2 = TempDir::new_in(env::temp_dir()).unwrap();
-        let log_path2 = tmp_dir2.path().join("log2");
-        let kv_path2 = tmp_dir2.path().join("kv2");
-
-        let tmp_dir3 = TempDir::new_in(env::temp_dir()).unwrap();
-        let log_path3 = tmp_dir3.path().join("log3");
-        let kv_path3 = tmp_dir3.path().join("kv3");
-
-        let kv_backend1 = KvBackend::create(&kv_path1).unwrap();
-
-        let log_backend1 = LogBackend::create(&log_path1, kv_backend1.clone()).unwrap();
-
-        let kv_backend2 = KvBackend::create(&kv_path2).unwrap();
-
-        let log_backend2 = LogBackend::create(&log_path2, kv_backend2.clone()).unwrap();
-
-        let kv_backend3 = KvBackend::create(&kv_path3).unwrap();
-
-        let log_backend3 = LogBackend::create(&log_path3, kv_backend3.clone()).unwrap();
-
-        let mut backends = HashMap::from([
-            (1, (log_backend1, kv_backend1)),
-            (2, (log_backend2, kv_backend2)),
-            (3, (log_backend3, kv_backend3)),
-        ]);
-
-        // to skip the wait other nodes online
-        for (log_backend, _) in backends.values_mut() {
-            log_backend
-                .apply_config_state(ConfigState {
-                    voters: vec![1, 2, 3],
-                    ..Default::default()
-                })
-                .unwrap();
-        }
-
-        let mut mailbox_senders = HashMap::new();
-        let mut mailboxes = HashMap::new();
-        let mut proposal_request_senders = HashMap::new();
-        let mut proposal_request_queues = HashMap::new();
-        let mut get_request_senders = HashMap::new();
-        let mut get_request_queues = HashMap::new();
-        let mut node_change_event_receivers = HashMap::new();
-
-        for node_id in 1..=3 {
-            let (mailbox_sender, mailbox) = flume::unbounded();
-
-            mailbox_senders.insert(node_id, mailbox_sender);
-            mailboxes.insert(node_id, mailbox);
-
-            let (proposal_request_sender, proposal_request_queue) = flume::unbounded();
-            proposal_request_senders.insert(node_id, proposal_request_sender);
-            proposal_request_queues.insert(node_id, proposal_request_queue);
-
-            let (get_request_sender, get_request_queue) = flume::unbounded();
-            get_request_senders.insert(node_id, get_request_sender);
-            get_request_queues.insert(node_id, get_request_queue);
-
-            let (node_change_event_sender, node_change_event_receiver) = flume::unbounded();
-            node_change_event_receivers.insert(node_id, node_change_event_receiver);
-
-            // ignore receiver recv failed, here we don't need to send node change event
-            mem::forget(node_change_event_sender);
-        }
-
-        let stop_signal = Arc::new(AtomicBool::new(false));
-
-        let mut nodes = vec![];
-        for node_id in 1..=3 {
-            let mut builder = NodeBuilder::default();
-
-            let (log_backend, kv_backend) = backends.remove(&node_id).unwrap();
-            let mailbox = mailboxes.remove(&node_id).unwrap();
-
-            let other_node_mailbox_senders = if node_id == 1 {
-                let mailbox2 = mailbox_senders.get(&2).unwrap().clone();
-                let mailbox3 = mailbox_senders.get(&3).unwrap().clone();
-
-                [(2, mailbox2), (3, mailbox3)]
-            } else if node_id == 2 {
-                let mailbox1 = mailbox_senders.get(&1).unwrap().clone();
-                let mailbox3 = mailbox_senders.get(&3).unwrap().clone();
-
-                [(1, mailbox1), (3, mailbox3)]
-            } else {
-                let mailbox1 = mailbox_senders.get(&1).unwrap().clone();
-                let mailbox2 = mailbox_senders.get(&2).unwrap().clone();
-
-                [(1, mailbox1), (2, mailbox2)]
-            }
-            .into();
-
-            let proposal_request_queue = proposal_request_queues.remove(&node_id).unwrap();
-            let get_request_queue = get_request_queues.remove(&node_id).unwrap();
-            let node_change_event_receiver = node_change_event_receivers.remove(&node_id).unwrap();
-
-            builder
-                .config(Config::new(node_id))
-                .storage(log_backend)
-                .kv(kv_backend)
-                .mailbox(mailbox)
-                .proposal_request_queue(proposal_request_queue)
-                .get_request_queue(get_request_queue)
-                .node_change_event_receiver(node_change_event_receiver)
-                .stop_signal(stop_signal.clone());
-
-            let mut node = builder.build().unwrap();
-
-            // todo for test
-            node.other_node_mailboxes = other_node_mailbox_senders;
-
-            nodes.push(node);
-        }
-
-        let join_handles = nodes
-            .into_iter()
-            .map(|mut node| {
-                thread::spawn(move || {
-                    node.run()
-                        .tap_err(|err| error!(%err, "node stop with error"))
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let mut leader_id = 1;
-
-        loop {
-            dbg!(leader_id);
-
-            let sender = proposal_request_senders.get_mut(&leader_id).unwrap();
-
-            let (reply, result_receiver) = ProposalRequestReply::new(KeyValueOperation::new(
-                Operation::InsertOrUpdate,
-                b"test1".as_slice(),
-                b"test1".as_slice(),
-            ));
-
-            sender.send(reply).unwrap();
-
-            match result_receiver.recv().unwrap() {
-                Err(RequestError::NotLeader(new_leader)) => {
-                    dbg!(new_leader);
-
-                    if new_leader != 0 {
-                        leader_id = new_leader;
-                    }
-
-                    thread::sleep(Duration::from_millis(100));
-
-                    continue;
-                }
-
-                Ok(_) => {
-                    eprintln!("proposal request done");
-
-                    break;
-                }
-
-                Err(err) => panic!("{}", err),
-            }
-        }
-
-        loop {
-            dbg!(leader_id);
-
-            let sender = get_request_senders.get_mut(&leader_id).unwrap();
-
-            let (reply, result_receiver) = GetRequestReply::new(b"test1".as_slice());
-
-            sender.send(reply).unwrap();
-
-            match result_receiver.recv().unwrap() {
-                Err(RequestError::NotLeader(new_leader)) => {
-                    dbg!(new_leader);
-
-                    leader_id = new_leader;
-
-                    thread::sleep(Duration::from_millis(100));
-
-                    continue;
-                }
-
-                Ok(value) => {
-                    println!("{}", String::from_utf8_lossy(&value.unwrap()));
-
-                    break;
-                }
-
-                Err(err) => panic!("{}", err),
-            }
-        }
-
-        stop_signal.store(true, Ordering::Release);
-
-        for join_handle in join_handles {
-            let _ = join_handle.join();
-        }
-    }
 
     #[test]
     fn node_init_with_register_test() {
@@ -1121,7 +897,7 @@ mod tests {
 
         let stop_signal = Arc::new(AtomicBool::new(false));
 
-        let mut nodes = vec![];
+        let mut join_handles = vec![];
         for node_id in 1..=3 {
             let mut builder = NodeBuilder::default();
 
@@ -1142,9 +918,14 @@ mod tests {
                 .node_change_event_receiver(node_change_event_receiver)
                 .stop_signal(stop_signal.clone());
 
-            let node = builder.build().unwrap();
+            let handle = thread::spawn(move || {
+                let mut node = builder.build().unwrap();
 
-            nodes.push(node);
+                node.run()
+                    .tap_err(|err| error!(%err, "node stop with error"))
+            });
+
+            join_handles.push(handle);
         }
 
         for node_id in 1..=3 {
@@ -1201,16 +982,6 @@ mod tests {
             // to avoid node change event receiver disconnected
             mem::forget(node_change_event_sender);
         }
-
-        let join_handles = nodes
-            .into_iter()
-            .map(|mut node| {
-                thread::spawn(move || {
-                    node.run()
-                        .tap_err(|err| error!(%err, "node stop with error"))
-                })
-            })
-            .collect::<Vec<_>>();
 
         let mut leader_id = 1;
 

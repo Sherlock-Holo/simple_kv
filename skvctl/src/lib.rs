@@ -85,13 +85,23 @@ async fn handle_operation(
     match op {
         Operation::Insert { key, value } => {
             match insert(&mut client, key.clone(), value.clone()).await? {
-                KVResult::NotLeader(leader) => handle_operation(op, nodes, leader).await,
+                KVResult::NotLeader(mut leader) => {
+                    if leader == 0 {
+                        leader = node_id;
+                    }
+                    handle_operation(op, nodes, leader).await
+                }
 
                 KVResult::Result(_) => Ok(()),
             }
         }
         Operation::Get { key } => match get(&mut client, key.clone()).await? {
-            KVResult::NotLeader(leader) => handle_operation(op, nodes, leader).await,
+            KVResult::NotLeader(mut leader) => {
+                if leader == 0 {
+                    leader = node_id;
+                }
+                handle_operation(op, nodes, leader).await
+            }
             KVResult::Result(value) => match value {
                 None => process::exit(1),
                 Some(value) => {
@@ -102,7 +112,12 @@ async fn handle_operation(
             },
         },
         Operation::Delete { key } => match delete(&mut client, key.clone()).await? {
-            KVResult::NotLeader(leader) => handle_operation(op, nodes, leader).await,
+            KVResult::NotLeader(mut leader) => {
+                if leader == 0 {
+                    leader = node_id;
+                }
+                handle_operation(op, nodes, leader).await
+            }
             KVResult::Result(_) => Ok(()),
         },
     }

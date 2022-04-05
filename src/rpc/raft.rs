@@ -1,29 +1,32 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::BytesMut;
+use dashmap::DashMap;
 use flume::r#async::{RecvStream, SendSink};
 use flume::{Receiver, Sender};
 use futures_util::future::Either;
-use futures_util::{future, stream, SinkExt, StreamExt};
+use futures_util::{future, stream, SinkExt, Stream, StreamExt};
 use prost07::Message;
 use raft::eraftpb;
+use rand::prelude::*;
 use tap::TapFallible;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tonic::transport::{Channel, Server};
 use tonic::{IntoRequest, Request, Response, Status};
-use tracing::{error, info, info_span, instrument, warn, Instrument};
+use tracing::{debug, error, info, info_span, instrument, warn, Instrument};
 
 use super::connect::Connector;
 use super::pb::simple_kv::raft_client::RaftClient;
 use super::pb::simple_kv::raft_server::{Raft, RaftServer};
 use super::pb::simple_kv::*;
 use super::register::RpcRaftNodeEvent;
-use crate::stream_ext::select_either;
 
 struct PeerNode {
     id: u64,
@@ -46,7 +49,7 @@ impl PeerNode {
 
                 let message = buf.freeze();
 
-                info!("encode raft message done");
+                debug!("encode raft message done");
 
                 let timeout = Duration::from_secs(1);
 
@@ -67,7 +70,7 @@ impl PeerNode {
                     }
 
                     Ok(Ok(_)) => {
-                        info!("send raft message to peer node done");
+                        debug!("send raft message to peer node done");
 
                         Ok(())
                     }
@@ -97,7 +100,7 @@ impl Raft for LocalNode {
             Status::failed_precondition("decode raft message request failed")
         })?;
 
-        info!("decode raft message done");
+        debug!("decode raft message done");
 
         self.raft_message_sender
             .clone()
@@ -109,7 +112,7 @@ impl Raft for LocalNode {
                 Status::failed_precondition("send other node raft message to local node failed")
             })?;
 
-        info!("send other node raft message to local node done");
+        debug!("send other node raft message to local node done");
 
         Ok(Response::new(RaftMessageResponse {}))
     }
@@ -118,7 +121,7 @@ impl Raft for LocalNode {
 pub struct Rpc {
     grpc_listen_addr: SocketAddr,
     local_node: Option<LocalNode>,
-    peer_nodes: HashMap<u64, PeerNode>,
+    peer_node_mailboxes: PeerNodeMailboxes,
     rpc_raft_node_change_event_receiver: Receiver<RpcRaftNodeEvent>,
 }
 
@@ -135,7 +138,7 @@ impl Rpc {
         Self {
             grpc_listen_addr: listen_addr,
             local_node: Some(local_node),
-            peer_nodes: Default::default(),
+            peer_node_mailboxes: Default::default(),
             rpc_raft_node_change_event_receiver,
         }
     }
@@ -154,36 +157,24 @@ impl Rpc {
     }
 
     async fn run_peer_nodes(&mut self) -> anyhow::Result<()> {
-        let peer_node_mailboxes = self
-            .peer_nodes
-            .iter()
-            .map(|(peer_node_id, peer_node)| (*peer_node_id, peer_node.mailbox.clone()))
-            .map(|(peer_node_id, peer_node_mailbox)| {
-                peer_node_mailbox.map(move |message| (peer_node_id, message))
-            });
+        let peer_node_mailboxes = self.peer_node_mailboxes.clone().map(Either::Left);
 
-        let peer_node_mailboxes = stream::select_all(peer_node_mailboxes);
-
-        let mut either_stream = select_either(
+        let mut either_stream = stream::select(
             peer_node_mailboxes,
             self.rpc_raft_node_change_event_receiver
                 .clone()
-                .into_stream(),
+                .into_stream()
+                .map(Either::Right),
         );
 
         while let Some(either) = either_stream.next().await {
             match either {
-                Either::Left((peer_node_id, message)) => match self.peer_nodes.get(&peer_node_id) {
-                    None => {
-                        warn!(peer_node_id, "raft message target node not exist");
-                    }
+                Either::Left((peer_node_id, message)) => {
+                    self.peer_node_mailboxes
+                        .send_message_to_peer_node(peer_node_id, message);
 
-                    Some(peer_node) => {
-                        peer_node.send_message_background(message);
-
-                        info!(peer_node_id, "send message to peer node in background");
-                    }
-                },
+                    debug!(peer_node_id, "send message to peer node done");
+                }
 
                 Either::Right(change_event) => {
                     self.handle_node_change_event(change_event).await?;
@@ -198,8 +189,6 @@ impl Rpc {
 
     #[instrument(skip(self), err)]
     async fn handle_node_change_event(&mut self, event: RpcRaftNodeEvent) -> anyhow::Result<()> {
-        info!(?event, "handle node change event");
-
         match event {
             RpcRaftNodeEvent::Add {
                 node_id,
@@ -212,7 +201,7 @@ impl Rpc {
 
                 let (mailbox_sender, mailbox) = flume::unbounded();
 
-                self.peer_nodes.insert(
+                self.peer_node_mailboxes.insert_peer_node(
                     node_id,
                     PeerNode {
                         id: node_id,
@@ -230,7 +219,7 @@ impl Rpc {
             }
 
             RpcRaftNodeEvent::Remove { node_id } => {
-                self.peer_nodes.remove(&node_id);
+                self.peer_node_mailboxes.remove_peer_node(node_id);
 
                 info!(node_id, "remove peer node done");
             }
@@ -250,4 +239,66 @@ async fn run_local_node(listen_addr: SocketAddr, local_node: LocalNode) -> anyho
     Err(anyhow::anyhow!(
         "local raft node grpc server stopped unexpected"
     ))
+}
+
+#[derive(Clone, Default)]
+struct PeerNodeMailboxes {
+    peer_nodes: Arc<DashMap<u64, PeerNode>>,
+}
+
+impl Stream for PeerNodeMailboxes {
+    type Item = (u64, eraftpb::Message);
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        if self.peer_nodes.is_empty() {
+            return Poll::Pending;
+        }
+
+        let mut node_ids = self
+            .peer_nodes
+            .iter()
+            .map(|item| *item.key())
+            .collect::<Vec<_>>();
+
+        // rand slice to make sure no peer_node is starved
+        node_ids.shuffle(&mut rand::thread_rng());
+
+        for node_id in node_ids {
+            let mut peer_node = self.peer_nodes.get_mut(&node_id).unwrap();
+            match peer_node.mailbox.poll_next_unpin(cx) {
+                Poll::Ready(Some(item)) => return Poll::Ready(Some((node_id, item))),
+
+                _ => continue,
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+impl PeerNodeMailboxes {
+    fn insert_peer_node(&self, node_id: u64, peer_node: PeerNode) {
+        self.peer_nodes.insert(node_id, peer_node);
+    }
+
+    fn remove_peer_node(&self, node_id: u64) {
+        self.peer_nodes.remove(&node_id);
+    }
+
+    fn send_message_to_peer_node(&self, node_id: u64, message: eraftpb::Message) {
+        match self.peer_nodes.get(&node_id) {
+            None => {
+                warn!(node_id, "raft message target node not exist");
+            }
+
+            Some(peer_node) => {
+                peer_node.send_message_background(message);
+
+                debug!(node_id, "send message to peer node in background");
+            }
+        }
+    }
 }
