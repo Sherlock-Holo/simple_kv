@@ -9,7 +9,8 @@ use crate::pb::*;
 
 #[derive(Debug, Clone)]
 struct Node {
-    uri: Uri,
+    raft_uri: Uri,
+    kv_uri: Uri,
 }
 
 #[derive(Default)]
@@ -26,15 +27,21 @@ impl Register for Registry {
     ) -> Result<Response<RegisterNodeResponse>, Status> {
         let req = request.into_inner();
 
-        let uri = req.node_uri.parse::<Uri>().map_err(|err| {
-            error!(%err, "node url invalid");
+        let raft_uri = req.node_uri.parse::<Uri>().map_err(|err| {
+            error!(%err, "node uri invalid");
 
-            Status::invalid_argument(format!("node url {} invalid", req.node_uri))
+            Status::invalid_argument(format!("node uri {} invalid", req.node_uri))
         })?;
 
-        debug!(node_id = req.node_id, %uri, "parse node uri done");
+        let kv_uri = req.kv_uri.parse::<Uri>().map_err(|err| {
+            error!(?err, "kv uri invalid");
 
-        self.nodes.insert(req.node_id, Node { uri });
+            Status::invalid_argument(format!("kv uri {} invalid", req.kv_uri))
+        })?;
+
+        debug!(node_id = req.node_id, %raft_uri, "parse node uri done");
+
+        self.nodes.insert(req.node_id, Node { raft_uri, kv_uri });
 
         Ok(Response::new(RegisterNodeResponse {}))
     }
@@ -53,7 +60,8 @@ impl Register for Registry {
             .filter(|node| *node.key() != req.self_node_id)
             .map(|node| NodeInfo {
                 node_id: *node.key(),
-                node_uri: node.uri.to_string(),
+                node_uri: node.raft_uri.to_string(),
+                kv_uri: node.kv_uri.to_string(),
             })
             .collect::<Vec<_>>();
 
@@ -95,8 +103,8 @@ mod tests {
             .register_node(
                 RegisterNodeRequest {
                     node_id: 1,
-
                     node_uri: "http://127.0.0.1".to_string(),
+                    kv_uri: "http://127.0.0.1".to_string(),
                 }
                 .into_request(),
             )
@@ -105,7 +113,8 @@ mod tests {
 
         let node = registry.nodes.get(&1).unwrap();
         assert_eq!(*node.key(), 1);
-        assert_eq!(node.uri, Uri::from_static("http://127.0.0.1"));
+        assert_eq!(node.raft_uri, Uri::from_static("http://127.0.0.1"));
+        assert_eq!(node.kv_uri, Uri::from_static("http://127.0.0.1"));
     }
 
     #[tokio::test]
@@ -117,6 +126,7 @@ mod tests {
                 RegisterNodeRequest {
                     node_id: 1,
                     node_uri: "http://127.0.0.1".to_string(),
+                    kv_uri: "http://127.0.0.1".to_string(),
                 }
                 .into_request(),
             )
@@ -130,7 +140,8 @@ mod tests {
         let node = &resp.into_inner().node_list[0];
 
         assert_eq!(node.node_id, 1);
-        assert_eq!(node.node_uri, "http://127.0.0.1/".to_string());
+        assert_eq!(node.node_uri, "http://127.0.0.1/");
+        assert_eq!(node.kv_uri, "http://127.0.0.1/");
     }
 
     #[tokio::test]
@@ -142,6 +153,7 @@ mod tests {
                 RegisterNodeRequest {
                     node_id: 1,
                     node_uri: "http://127.0.0.1".to_string(),
+                    kv_uri: "http://127.0.0.1".to_string(),
                 }
                 .into_request(),
             )

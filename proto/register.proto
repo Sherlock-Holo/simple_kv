@@ -5,6 +5,7 @@ package skv_register;
 message RegisterNodeRequest {
   uint64 node_id = 1;
   string node_uri = 3;
+  string kv_uri = 4;
 }
 
 message RegisterNodeResponse {
@@ -17,6 +18,7 @@ message ListNodesRequest {
 message NodeInfo {
   uint64 node_id = 1;
   string node_uri = 2;
+  string kv_uri = 3;
 }
 
 message ListNodesResponse {
